@@ -19,3 +19,22 @@ class RuntimeConfig(BaseModel):
     upstream_ready_interval_s: float = Field(
         description="Polling interval in seconds when waiting for the upstream to become ready."
     )
+
+    db_url: str = Field(
+        default="sqlite+aiosqlite:///./agentic_api.db",
+        description="SQLAlchemy async database URL.",
+    )
+    db_dialect: str = Field(
+        default="sqlite",
+        description='Database dialect: "sqlite" or "postgresql".',
+    )
+
+    response_store_enabled: bool = Field(
+        default=True,
+        description="Enable response persistence for multi-turn rehydration.",
+    )
+
+    log_model_messages: bool = Field(
+        default=False,
+        description="Log full pydantic_ai model messages on engine failure (verbose).",
+    )

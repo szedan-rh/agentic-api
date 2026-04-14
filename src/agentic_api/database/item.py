@@ -1,0 +1,79 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any
+
+from sqlalchemy import DateTime, String, select
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.types import JSON
+
+from agentic_api.database import Base
+from agentic_api.database.session import (
+    session_add_all,
+    session_add_one,
+    session_delete,
+    session_get_all,
+    session_get_one,
+)
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class Item(Base):
+    """An immutable payload unit — one user message, one assistant output item, one tool result.
+
+    `data` stores a versioned JSON blob (`ItemPayload`) so the schema can evolve
+    without altering the table. Items are never mutated after creation.
+    """
+
+    __tablename__ = "items"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    data: Mapped[dict[str, Any]] = mapped_column(
+        JSON().with_variant(JSONB, "postgresql"),
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        index=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# CRUD
+# ---------------------------------------------------------------------------
+
+
+@session_add_one
+async def create_item(*, id: str, data: dict[str, Any]) -> Item:
+    """Insert a new Item row. Raises IntegrityError if the ID already exists."""
+    return Item(id=id, data=data, created_at=_utcnow())
+
+
+@session_add_all
+async def create_items(items: list[tuple[str, dict[str, Any]]]) -> list[Item]:
+    """Bulk-insert Item rows. Raises IntegrityError if any ID already exists."""
+    now = _utcnow()
+    return [Item(id=item_id, data=data, created_at=now) for item_id, data in items]
+
+
+@session_get_one
+async def get_item(*, id: str):
+    """Fetch a single Item by primary key. Returns None if not found."""
+    return select(Item).where(Item.id == id)
+
+
+@session_get_all
+async def get_items(*, ids: list[str]):
+    """Bulk-fetch Items by ID. Returns a list in unspecified order."""
+    return select(Item).where(Item.id.in_(ids))
+
+
+@session_delete
+async def delete_item(*, id: str):
+    """Delete an Item by ID. Silently does nothing if not found."""
+    return select(Item).where(Item.id == id)

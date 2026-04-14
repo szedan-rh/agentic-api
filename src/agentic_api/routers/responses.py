@@ -1,7 +1,11 @@
-from fastapi import APIRouter, Request
-from fastapi.responses import Response
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from agentic_api.core.engine import Engine
 from agentic_api.core.proxy import ProxyClientManager, proxy_responses
+from agentic_api.utils.exceptions import BadInputError, ResponsesAPIError
+from agentic_api.store.rehydration import ResponseStore
+from agentic_api.types.responses import ResponsesRequest
 
 router = APIRouter()
 
@@ -9,9 +13,61 @@ router = APIRouter()
 @router.post("/v1/responses")
 async def create_response(request: Request) -> Response:
     runtime_config = request.app.state.runtime_config
-    proxy_client_manager: ProxyClientManager = request.app.state.proxy_client_manager
-    return await proxy_responses(
-        request=request,
+    response_store: ResponseStore | None = request.app.state.response_store
+
+    # If the response store is disabled, fall back to a raw proxy passthrough.
+    if response_store is None:
+        proxy_client_manager: ProxyClientManager = (
+            request.app.state.proxy_client_manager
+        )
+        return await proxy_responses(
+            request=request,
+            runtime_config=runtime_config,
+            proxy_client_manager=proxy_client_manager,
+        )
+
+    try:
+        body = await request.json()
+        responses_request = ResponsesRequest.model_validate(body)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    engine = Engine(
+        responses_request,
+        store=response_store,
         runtime_config=runtime_config,
-        proxy_client_manager=proxy_client_manager,
+    )
+
+    try:
+        result = await engine.run()
+    except ResponsesAPIError as exc:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "error": {
+                    "message": str(exc),
+                    "type": exc.error_type,
+                    "param": exc.param,
+                    "code": exc.code,
+                }
+            },
+        )
+    except BadInputError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"message": str(exc), "type": "invalid_request_error"}},
+        )
+
+    # Streaming: result is an async generator of SSE frames.
+    if responses_request.stream:
+        return StreamingResponse(
+            result,  # type: ignore[arg-type]
+            media_type="text/event-stream",
+            headers={"X-Accel-Buffering": "no"},
+        )
+
+    # Non-streaming: result is a ResponsesResponse.
+    return JSONResponse(
+        status_code=200,
+        content=result.model_dump(mode="json"),  # type: ignore[union-attr]
     )

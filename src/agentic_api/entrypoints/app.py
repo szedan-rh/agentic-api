@@ -5,7 +5,10 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from agentic_api.config.runtime import RuntimeConfig
 from agentic_api.core.proxy import ProxyClientManager
+from agentic_api.database.schema import SchemaManager
+from agentic_api.database.db_engine import create_db_engine_async
 from agentic_api.routers import responses
+from agentic_api.store.rehydration import ResponseStore
 
 
 def create_app(runtime_config: RuntimeConfig) -> FastAPI:
@@ -13,8 +16,26 @@ def create_app(runtime_config: RuntimeConfig) -> FastAPI:
     async def lifespan(app: FastAPI):
         app.state.runtime_config = runtime_config
         app.state.proxy_client_manager = ProxyClientManager()
+
+        if runtime_config.response_store_enabled:
+            engine = create_db_engine_async(
+                db_url=runtime_config.db_url,
+                db_dialect=runtime_config.db_dialect,
+            )
+            schema_manager = SchemaManager(engine)
+            await schema_manager.ensure_ready(
+                gateway_workers=runtime_config.gateway_workers,
+                db_dialect=runtime_config.db_dialect,
+            )
+            app.state.response_store = ResponseStore(engine=engine)
+        else:
+            app.state.response_store = None
+
         yield
+
         await app.state.proxy_client_manager.aclose()
+        if runtime_config.response_store_enabled:
+            await engine.dispose()
 
     app = FastAPI(
         title="Agentic API",
