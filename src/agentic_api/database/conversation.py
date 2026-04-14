@@ -5,11 +5,13 @@ from typing import Any
 
 from sqlalchemy import DateTime, String, select
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
 
 from agentic_api.database import Base
 from agentic_api.database.session import (
+    run_in_session,
     session_add_one,
     session_delete,
     session_get_all,
@@ -102,6 +104,27 @@ async def get_conversation(*, id: str):
 async def get_conversations(*, ids: list[str]):
     """Bulk-fetch Conversations by ID. Returns a list in unspecified order."""
     return select(Conversation).where(Conversation.id.in_(ids))
+
+
+@run_in_session
+async def update_conversation_item_ids(
+    session: AsyncSession,
+    *,
+    id: str,
+    item_ids: list[str],
+) -> Conversation | None:
+    """Append item_ids to a Conversation row and update updated_at.
+
+    Returns the updated Conversation, or None if not found.
+    """
+    result = await session.execute(select(Conversation).where(Conversation.id == id))
+    conversation = result.scalar_one_or_none()
+    if conversation is None:
+        return None
+    conversation.item_ids = item_ids
+    conversation.updated_at = _utcnow()
+    await session.flush()
+    return conversation
 
 
 @session_delete

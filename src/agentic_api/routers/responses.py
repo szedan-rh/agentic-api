@@ -4,7 +4,8 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from agentic_api.core.engine import Engine
 from agentic_api.core.proxy import ProxyClientManager, proxy_responses
 from agentic_api.utils.exceptions import BadInputError, ResponsesAPIError
-from agentic_api.store.rehydration import ResponseStore
+from agentic_api.store.conversation import ConversationStore
+from agentic_api.store.response import ResponseStore
 from agentic_api.types.responses import ResponsesRequest
 
 router = APIRouter()
@@ -14,6 +15,7 @@ router = APIRouter()
 async def create_response(request: Request) -> Response:
     runtime_config = request.app.state.runtime_config
     response_store: ResponseStore | None = request.app.state.response_store
+    conversation_store: ConversationStore | None = request.app.state.conversation_store
 
     # If the response store is disabled, fall back to a raw proxy passthrough.
     if response_store is None:
@@ -34,7 +36,8 @@ async def create_response(request: Request) -> Response:
 
     engine = Engine(
         responses_request,
-        store=response_store,
+        response_store=response_store,
+        conversation_store=conversation_store,
         runtime_config=runtime_config,
     )
 

@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from agentic_api.database.item import Item, get_items
 from agentic_api.database.response import Response, get_response
 from agentic_api.database.session import configure_session_factory, session_transaction
-from agentic_api.store.translator import StoreInputTranslator
+from agentic_api.store.translator import ItemPayload, StoreInputTranslator
 from agentic_api.utils.exceptions import BadInputError, ResponsesAPIError
 from agentic_api.types.responses import (
     InputItem,
@@ -23,20 +23,11 @@ from agentic_api.types.responses import (
 )
 from agentic_api.utils.common import uuid7_str
 
-ITEM_DATA_VERSION = 1
-
 _PERSISTABLE_RESPONSE_STATUSES = frozenset({"completed", "incomplete"})
 
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
-
-
-class ItemPayload(BaseModel):
-    """Versioned wrapper around a single input or output item stored in Item.data."""
-
-    v: int = ITEM_DATA_VERSION
-    item: InputItem | OutputItem
 
 
 class ResponseMetadata(BaseModel):
@@ -52,6 +43,7 @@ class ResponseMetadata(BaseModel):
 @dataclass(frozen=True, slots=True)
 class StoredResponse:
     response_id: str
+    conversation_id: str | None
     previous_response_id: str | None
     model: str
     created_at: datetime
@@ -86,11 +78,11 @@ async def _persist_response_checkpoint(
 class ResponseStore:
     """Communicator between the Responses API layer and the three-table DB schema.
 
-    put_completed  — serialises history items + response checkpoint atomically via
-                     @session_transaction (single commit, all-or-nothing).
-    get            — loads a Response row and returns a StoredResponse read model.
-    rehydrate_request — bulk-fetches Item rows by history_item_ids, restores order,
-                        and builds the hydrated input for the next agent turn.
+    get           — loads a Response row and returns a StoredResponse read model.
+    put_completed — serialises history items + response checkpoint atomically via
+                    @session_transaction (single commit, all-or-nothing).
+    rehydrate     — bulk-fetches Item rows by history_item_ids, restores order,
+                    and returns the hydrated history for the next agent turn.
     """
 
     def __init__(self, *, engine: AsyncEngine) -> None:
@@ -105,12 +97,24 @@ class ResponseStore:
         metadata = ResponseMetadata.model_validate(response_row.response_metadata or {})
         return StoredResponse(
             response_id=response_row.id,
+            conversation_id=response_row.conversation_id,
             previous_response_id=response_row.previous_response_id,
             model=metadata.model,
             created_at=response_row.created_at,
             history_item_ids=response_row.history_item_ids or [],
             metadata=metadata,
         )
+
+    async def get_or_raise(self, *, response_id: str) -> StoredResponse:
+        stored = await self.get(response_id=response_id)
+        if stored is None:
+            raise ResponsesAPIError(
+                f"No response found with id '{response_id}'.",
+                status_code=400,
+                param="previous_response_id",
+                code="previous_response_not_found",
+            )
+        return stored
 
     async def put_completed(
         self,
@@ -160,51 +164,20 @@ class ResponseStore:
         except IntegrityError as e:
             raise BadInputError(f"Response id already exists: {response.id}") from e
 
-    async def rehydrate_request(self, *, request: ResponsesRequest) -> ResponsesRequest:
-        """Return an upstream-ready request with a fully hydrated conversation history.
+    async def rehydrate(
+        self, *, stored: StoredResponse
+    ) -> list[InputItem | OutputItem]:
+        """Bulk-fetch Item rows by history_item_ids and restore the original order.
 
-        Rehydration model:
-        1. Load Response row → get history_item_ids checkpoint.
-        2. Bulk-fetch Item rows and restore the original order.
-        3. Prepend history to new input.
+        Rehydration model (Responses API path):
+        1. Bulk-fetch all Item rows referenced by history_item_ids.
+        2. Restore item order in application code.
         """
-        new_input = self._translator.normalize_input(request.input)
-
-        if not request.previous_response_id:
-            return request.model_copy(update={"input": new_input})
-
-        stored = await self.get(response_id=request.previous_response_id)
-        if stored is None:
-            raise ResponsesAPIError(
-                f"No response found with id '{request.previous_response_id}'.",
-                status_code=400,
-                param="previous_response_id",
-                code="previous_response_not_found",
-            )
-
         items_by_id: dict[str, Item] = {
             item.id: item for item in await get_items(ids=stored.history_item_ids)
         }
-        history_items: list[InputItem | OutputItem] = [
+        return [
             ItemPayload.model_validate(items_by_id[item_id].data).item
             for item_id in stored.history_item_ids
             if item_id in items_by_id
         ]
-
-        fields_set = request.model_fields_set
-        return request.model_copy(
-            update={
-                "previous_response_id": None,
-                "input": [*history_items, *new_input],
-                "tools": self._translator.resolve_tools(
-                    request_tools=request.tools,
-                    stored_tools=stored.metadata.effective_tools,
-                    tools_explicitly_set="tools" in fields_set,
-                ),
-                "tool_choice": self._translator.resolve_tool_choice(
-                    request_tool_choice=request.tool_choice,
-                    stored_tool_choice=stored.metadata.effective_tool_choice,
-                    tool_choice_explicitly_set="tool_choice" in fields_set,
-                ),
-            }
-        )

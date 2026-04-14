@@ -156,6 +156,7 @@ class ResponsesRequest(BaseModel):
     input: str | list[InputItem]
     instructions: str | None = None
     previous_response_id: str | None = None
+    conversation_id: str | None = None
     tools: list[ResponsesTool] | None = None
     tool_choice: ToolChoice = Field(default_factory=AutoToolChoice)
     store: bool = True

@@ -1,12 +1,23 @@
 from __future__ import annotations
 
-from pydantic import TypeAdapter
+from pydantic import BaseModel, TypeAdapter
 
 from agentic_api.types.responses import (
     InputItem,
+    OutputItem,
     ResponsesTool,
     ToolChoice,
 )
+
+ITEM_DATA_VERSION = 1
+
+
+class ItemPayload(BaseModel):
+    """Versioned wrapper around a single input or output item stored in Item.data."""
+
+    v: int = ITEM_DATA_VERSION
+    item: InputItem | OutputItem
+
 
 _input_item_adapter = TypeAdapter(list[InputItem])
 _tools_adapter = TypeAdapter(list[ResponsesTool])

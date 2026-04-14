@@ -8,7 +8,8 @@ from agentic_api.core.proxy import ProxyClientManager
 from agentic_api.database.schema import SchemaManager
 from agentic_api.database.db_engine import create_db_engine_async
 from agentic_api.routers import responses
-from agentic_api.store.rehydration import ResponseStore
+from agentic_api.store.conversation import ConversationStore
+from agentic_api.store.response import ResponseStore
 
 
 def create_app(runtime_config: RuntimeConfig) -> FastAPI:
@@ -27,8 +28,10 @@ def create_app(runtime_config: RuntimeConfig) -> FastAPI:
                 gateway_workers=runtime_config.gateway_workers,
                 db_dialect=runtime_config.db_dialect,
             )
+            app.state.conversation_store = ConversationStore(engine=engine)
             app.state.response_store = ResponseStore(engine=engine)
         else:
+            app.state.conversation_store = None
             app.state.response_store = None
 
         yield
