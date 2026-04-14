@@ -118,6 +118,21 @@ class _FixedProxyClientManager(ProxyClientManager):
 
 
 @pytest.fixture
+async def db_engine():
+    from agentic_api.database.db_engine import create_db_engine_async
+    from agentic_api.database.schema import SchemaManager
+
+    engine = create_db_engine_async(
+        db_url="sqlite+aiosqlite:///:memory:",
+        db_dialect="sqlite",
+    )
+    schema = SchemaManager(engine)
+    await schema.ensure_ready(gateway_workers=1, db_dialect="sqlite")
+    yield engine
+    await engine.dispose()
+
+
+@pytest.fixture
 async def gateway_client() -> AsyncIterator[httpx.AsyncClient]:
     upstream_app = build_upstream_stub()
     upstream_transport = httpx.ASGITransport(app=upstream_app)

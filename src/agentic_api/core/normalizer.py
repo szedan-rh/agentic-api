@@ -92,10 +92,9 @@ class PydanticAINormalizer:
                 name=part.tool_name,
                 initial_arguments_json="",
             )
-            if part.args_as_json_str():
-                yield FunctionCallArgumentsDelta(
-                    item_key=item_key, delta=part.args_as_json_str()
-                )
+            args_json = part.args_as_json_str()
+            if args_json and args_json != "{}":
+                yield FunctionCallArgumentsDelta(item_key=item_key, delta=args_json)
 
     def _on_part_delta(self, event: PartDeltaEvent) -> Iterable[NormalizedEvent]:
         item_key = self._index_to_item_key.get(event.index)

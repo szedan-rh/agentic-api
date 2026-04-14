@@ -273,7 +273,6 @@ class ResponseComposer:
             self._response.incomplete_details = IncompleteDetails(
                 reason=event.incomplete_reason
             )
-            self._response.completed_at = None  # type: ignore[assignment]
             yield ResponseEvent(
                 type="response.incomplete",
                 sequence_number=self._incr_seq(),
