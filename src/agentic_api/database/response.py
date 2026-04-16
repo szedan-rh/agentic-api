@@ -25,8 +25,9 @@ class Response(Base):
     """A single Responses API response, used as a continuation checkpoint.
 
     `history_item_ids` is an ordered JSON array of Item IDs representing the full
-    history at the point this response was completed. It is null when `conversation_id`
-    is set — in that case the Conversation row owns the ordered history.
+    history at the point this response was completed. It is always populated, regardless
+    of whether `conversation_id` is set. It is the single authoritative checkpoint used
+    for rehydration on all paths (conversation and standalone).
 
     `previous_response_id` is a self-referencing FK for lineage inspection; it is not
     walked at rehydration time (the history_item_ids checkpoint is used instead).
@@ -49,7 +50,7 @@ class Response(Base):
         index=True,
         default=None,
     )
-    # Ordered Item ID checkpoint. Null when conversation_id is set.
+    # Ordered Item ID checkpoint. Always populated on both conversation and standalone paths.
     history_item_ids: Mapped[list[str] | None] = mapped_column(
         JSON().with_variant(JSONB, "postgresql"),
         nullable=True,

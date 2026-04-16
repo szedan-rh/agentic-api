@@ -111,7 +111,7 @@ async def test_single_turn_non_streaming() -> None:
                     "model": "test-model",
                     "input": "Reply with exactly one word: ALPHA",
                     "stream": False,
-                    "store": True,
+                    "response_store_enabled": True,
                 },
             )
 
@@ -133,7 +133,7 @@ async def test_single_turn_streaming() -> None:
                     "model": "test-model",
                     "input": "Reply with exactly one word: BETA",
                     "stream": True,
-                    "store": True,
+                    "response_store_enabled": True,
                 },
             ) as resp:
                 chunks = []
@@ -161,7 +161,7 @@ async def test_multi_turn_non_streaming() -> None:
                     "model": "test-model",
                     "input": "Reply with exactly one word: ALPHA",
                     "stream": False,
-                    "store": True,
+                    "response_store_enabled": True,
                 },
             )
         assert resp1.status_code == 200
@@ -175,7 +175,7 @@ async def test_multi_turn_non_streaming() -> None:
                     "input": "What was the single word I asked you to say in my first message?",
                     "previous_response_id": resp1_id,
                     "stream": False,
-                    "store": True,
+                    "response_store_enabled": True,
                 },
             )
         assert resp2.status_code == 200
@@ -197,7 +197,7 @@ async def test_multi_turn_streaming() -> None:
                     "model": "test-model",
                     "input": "Reply with exactly one word: BETA",
                     "stream": True,
-                    "store": True,
+                    "response_store_enabled": True,
                 },
             ) as resp:
                 sse1 = "".join([chunk async for chunk in resp.aiter_text()])
@@ -215,7 +215,7 @@ async def test_multi_turn_streaming() -> None:
                     "input": "What was the single word I asked you to say in my first message?",
                     "previous_response_id": stream1_id,
                     "stream": True,
-                    "store": True,
+                    "response_store_enabled": True,
                 },
             ) as resp:
                 sse2 = "".join([chunk async for chunk in resp.aiter_text()])
@@ -236,7 +236,7 @@ async def test_three_turn_chain() -> None:
                     "model": "test-model",
                     "input": "Reply with exactly one word: ALPHA",
                     "stream": False,
-                    "store": True,
+                    "response_store_enabled": True,
                 },
             )
         assert r1.status_code == 200
@@ -250,7 +250,7 @@ async def test_three_turn_chain() -> None:
                     "input": "Now also say BETA",
                     "previous_response_id": r1_id,
                     "stream": False,
-                    "store": True,
+                    "response_store_enabled": True,
                 },
             )
         assert r2.status_code == 200
@@ -268,7 +268,7 @@ async def test_three_turn_chain() -> None:
                     "input": "List every word I asked you to say, one per line.",
                     "previous_response_id": r2_id,
                     "stream": False,
-                    "store": True,
+                    "response_store_enabled": True,
                 },
             )
         assert r3.status_code == 200
@@ -287,7 +287,7 @@ async def test_store_false_not_persisted() -> None:
                     "model": "test-model",
                     "input": "hello",
                     "stream": False,
-                    "store": False,
+                    "response_store_enabled": False,
                 },
             )
         assert resp.status_code == 200
@@ -303,7 +303,7 @@ async def test_store_false_not_persisted() -> None:
                     "input": "follow up",
                     "previous_response_id": resp_id,
                     "stream": False,
-                    "store": False,
+                    "response_store_enabled": False,
                 },
             )
         assert follow_up.status_code == 400

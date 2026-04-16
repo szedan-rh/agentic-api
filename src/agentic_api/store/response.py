@@ -127,7 +127,7 @@ class ResponseStore:
             return
         if not response.id:
             return
-        if not request.store:
+        if not request.response_store_enabled:
             return
 
         hydrated_input = self._translator.normalize_input(hydrated_request.input)

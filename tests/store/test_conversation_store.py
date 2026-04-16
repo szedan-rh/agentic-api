@@ -27,7 +27,7 @@ async def test_get_returns_none_for_missing(store: ConversationStore) -> None:
 async def test_get_or_create_creates_new_conversation(store: ConversationStore) -> None:
     stored = await store.get_or_create(conversation_id="conv_001")
     assert stored.conversation_id == "conv_001"
-    assert stored.item_ids == []
+    assert stored.history_item_ids == []
 
 
 @pytest.mark.anyio
@@ -51,7 +51,7 @@ async def test_put_turn_appends_items(store: ConversationStore) -> None:
     )
 
     assert result.conversation_id == "conv_pt1"
-    assert len(result.item_ids) == 2
+    assert len(result.history_item_ids) == 2
 
 
 @pytest.mark.anyio
@@ -73,7 +73,7 @@ async def test_put_turn_accumulates_across_turns(store: ConversationStore) -> No
         response_metadata=_metadata(),
     )
 
-    assert len(result.item_ids) == 4
+    assert len(result.history_item_ids) == 4
 
 
 @pytest.mark.anyio

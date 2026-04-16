@@ -123,51 +123,76 @@ class Engine:
         )
 
     async def _resolve_conversation(self) -> StoredConversation | None:
-        """Load the Conversation row when conversation_id is present on the request.
+        """Determine which Conversation (if any) this request belongs to.
 
-        Returns None for pure Responses API requests (no conversation_id).
-        When conversation_id is provided, delegates to get_or_create which loads the
-        existing row or creates a new one if the ID is not yet known to the store.
+        When the store is enabled (conversation_store is not None) there are three cases:
+
+        1. conversation_id is present (with or without previous_response_id) → get_or_create
+           by that ID.
+        2. Only previous_response_id is present → look up the stored response to inherit its
+           conversation_id, if any. If the response has no conversation, falls through to
+           case 3.
+        3. Both absent (or previous_response_id has no conversation) → create a new
+           conversation row with a server-generated ID.
+
+        Rehydration always uses the Response row's history_item_ids regardless of which
+        case is taken. Persist diverges: conversation is not None → put_turn; None → put_completed.
+
+        Returns None only when the store is disabled entirely.
         """
-        if self._conversation_store is None or self._body.conversation_id is None:
+        if self._conversation_store is None:
             return None
-        return await self._conversation_store.get_or_create(
-            conversation_id=self._body.conversation_id
-        )
 
-    async def _rehydrate(
-        self, *, conversation: StoredConversation | None
-    ) -> ResponsesRequest:
+        if self._body.conversation_id is not None:
+            return await self._conversation_store.get_or_create(
+                conversation_id=self._body.conversation_id
+            )
+
+        if self._body.previous_response_id is not None:
+            stored_response = await self._response_store.get(
+                response_id=self._body.previous_response_id
+            )
+            if (
+                stored_response is not None
+                and stored_response.conversation_id is not None
+            ):
+                return await self._conversation_store.get(
+                    conversation_id=stored_response.conversation_id
+                )
+
+        # Both absent (or previous_response_id belongs to a standalone response) — new conversation.
+        conversation = await self._conversation_store.create()
+        return conversation
+
+    async def _rehydrate(self) -> ResponsesRequest:
         """Resolve the hydrated input for this request.
 
-        Branching:
-        - No previous_response_id: normalise input only.
-        - conversation set: Conversation API — use ConversationStore.rehydrate().
-        - otherwise: Responses API — use ResponseStore.rehydrate().
+        - No previous_response_id, no conversation_id: normalise input only (first turn).
+        - conversation_id present (no previous_response_id): load full history from
+          ConversationStore and prepend it to the new input.
+        - previous_response_id set: load stored response, bulk-fetch history items.
         """
         new_input = self._store_translator.normalize_input(self._body.input)
         if not self._body.previous_response_id:
+            if (
+                self._body.conversation_id is not None
+                and self._conversation_store is not None
+            ):
+                history_items = await self._conversation_store.rehydrate(
+                    conversation_id=self._body.conversation_id
+                )
+                if history_items:
+                    return self._body.model_copy(
+                        update={"input": [*history_items, *new_input]}
+                    )
             return self._body.model_copy(update={"input": new_input})
 
-        if conversation is not None:
-            # Conversation API path: Conversation.item_ids is the authoritative checkpoint.
-            history_items: list[
-                InputItem | OutputItem
-            ] = await self._conversation_store.rehydrate(  # type: ignore[union-attr]
-                conversation_id=conversation.conversation_id
-            )
-            return self._body.model_copy(
-                update={
-                    "previous_response_id": None,
-                    "input": [*history_items, *new_input],
-                }
-            )
-
-        # Responses API path: load stored response and use history_item_ids checkpoint.
         stored = await self._response_store.get_or_raise(
             response_id=self._body.previous_response_id
         )
-        history_items = await self._response_store.rehydrate(stored=stored)
+        history_items: list[
+            InputItem | OutputItem
+        ] = await self._response_store.rehydrate(stored=stored)
 
         fields_set = self._body.model_fields_set
         return self._body.model_copy(
@@ -204,7 +229,7 @@ class Engine:
             return
         if not response.id:
             return
-        if not self._body.store:
+        if not self._body.response_store_enabled:
             return
 
         if conversation is not None:
@@ -240,7 +265,7 @@ class Engine:
         """Resolve conversation, rehydrate history, and build a fresh Pipeline for this request."""
         response = ResponsesResponse.create_from_response_request(self._body)
         conversation = await self._resolve_conversation()
-        hydrated_body = await self._rehydrate(conversation=conversation)
+        hydrated_body = await self._rehydrate()
         run_settings = self._build_run_settings(hydrated_body)
         pipeline = Pipeline.build(response=response)
         return hydrated_body, conversation, run_settings, pipeline

@@ -29,7 +29,7 @@ def _utcnow() -> datetime:
 @dataclass(frozen=True, slots=True)
 class StoredConversation:
     conversation_id: str
-    item_ids: list[str]
+    history_item_ids: list[str]
     created_at: datetime
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -44,7 +44,7 @@ async def _persist_conversation_turn(
     full_item_ids: list[str],
     metadata: dict[str, Any],
 ) -> list[Any]:
-    """Atomically write new Item rows and a Response checkpoint, then update Conversation.item_ids.
+    """Atomically write new Item rows and a Response checkpoint, then update Conversation.history_item_ids.
 
     Item and Response are built as ORM objects and returned for a single flush by
     @session_transaction. update_conversation_item_ids uses @run_in_session which joins
@@ -58,7 +58,7 @@ async def _persist_conversation_turn(
         id=response_id,
         conversation_id=conversation_id,
         previous_response_id=previous_response_id,
-        history_item_ids=None,  # Conversation owns the ordered list (ADR-02 D4)
+        history_item_ids=full_item_ids,
         response_metadata=metadata,
         created_at=now,
         updated_at=now,
@@ -70,18 +70,29 @@ async def _persist_conversation_turn(
 class ConversationStore:
     """Read/write interface between the Conversation API layer and the three-table DB schema.
 
+    create        — inserts a new Conversation row with a server-generated ID.
     get_or_create — load an existing Conversation by ID, or create a new one if no ID
                     is provided (or the ID is not found). Always returns a StoredConversation.
     get           — loads a Conversation row and returns a StoredConversation read model.
     put_turn      — atomically writes new Item rows, a Response checkpoint, and extends
-                    Conversation.item_ids — all in a single Session commit.
-    rehydrate     — bulk-fetches Item rows by Conversation.item_ids, restores order,
+                    Conversation.history_item_ids — all in a single Session commit.
+    rehydrate     — bulk-fetches Item rows by Conversation.history_item_ids, restores order,
                     and returns the ordered history as a list of items.
     """
 
     def __init__(self, *, engine: AsyncEngine) -> None:
         # Session factory is shared — configure_session_factory is idempotent.
         configure_session_factory(engine)
+
+    async def create(self) -> StoredConversation:
+        """Create a new Conversation with a server-generated ID."""
+        row = await create_conversation(id=uuid7_str("conv_"))
+        return StoredConversation(
+            conversation_id=row.id,
+            history_item_ids=[],
+            created_at=row.created_at,
+            metadata={},
+        )
 
     async def get_or_create(self, *, conversation_id: str) -> StoredConversation:
         """Return an existing Conversation by ID, or create a new one if not found.
@@ -96,7 +107,7 @@ class ConversationStore:
         row = await create_conversation(id=conversation_id)
         return StoredConversation(
             conversation_id=row.id,
-            item_ids=[],
+            history_item_ids=[],
             created_at=row.created_at,
             metadata={},
         )
@@ -107,7 +118,7 @@ class ConversationStore:
             return None
         return StoredConversation(
             conversation_id=row.id,
-            item_ids=row.item_ids or [],
+            history_item_ids=row.history_item_ids or [],
             created_at=row.created_at,
             metadata=row.metadata_ or {},
         )
@@ -125,8 +136,8 @@ class ConversationStore:
 
         Within a single Session commit:
         1. Bulk-insert new Item rows.
-        2. Insert Response checkpoint (history_item_ids=None — Conversation owns the list).
-        3. Update Conversation.item_ids to append the new item IDs.
+        2. Insert Response checkpoint with history_item_ids set to the full ordered list.
+        3. Update Conversation.history_item_ids to append the new item IDs.
 
         Raises BadInputError if conversation_id does not exist or response_id already exists.
         """
@@ -143,7 +154,7 @@ class ConversationStore:
                 (item_id, ItemPayload(item=item).model_dump(mode="json"))
             )
 
-        full_item_ids = [*stored.item_ids, *new_item_ids]
+        full_item_ids = [*stored.history_item_ids, *new_item_ids]
 
         try:
             await _persist_conversation_turn(
@@ -159,7 +170,7 @@ class ConversationStore:
 
         return StoredConversation(
             conversation_id=stored.conversation_id,
-            item_ids=full_item_ids,
+            history_item_ids=full_item_ids,
             created_at=stored.created_at,
             metadata=stored.metadata,
         )
@@ -167,7 +178,7 @@ class ConversationStore:
     async def rehydrate(self, *, conversation_id: str) -> list[InputItem | OutputItem]:
         """Return the full ordered history for a conversation.
 
-        1. Load Conversation row → get ordered item_ids.
+        1. Load Conversation row → get ordered history_item_ids.
         2. Bulk-fetch Item rows.
         3. Restore order in application code.
         """
@@ -181,10 +192,10 @@ class ConversationStore:
             )
 
         items_by_id: dict[str, Item] = {
-            item.id: item for item in await get_items(ids=stored.item_ids)
+            item.id: item for item in await get_items(ids=stored.history_item_ids)
         }
         return [
             ItemPayload.model_validate(items_by_id[item_id].data).item
-            for item_id in stored.item_ids
+            for item_id in stored.history_item_ids
             if item_id in items_by_id
         ]

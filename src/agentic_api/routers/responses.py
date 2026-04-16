@@ -37,7 +37,9 @@ async def create_response(request: Request) -> Response:
     engine = Engine(
         responses_request,
         response_store=response_store,
-        conversation_store=conversation_store,
+        conversation_store=conversation_store
+        if responses_request.conversation_store_enabled
+        else None,
         runtime_config=runtime_config,
     )
 

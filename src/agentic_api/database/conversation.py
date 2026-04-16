@@ -26,12 +26,9 @@ def _utcnow() -> datetime:
 class Conversation(Base):
     """An ordered collection of Items representing a full conversation thread.
 
-    Used by the Conversation API path. When a Response belongs to a Conversation,
-    `Response.history_item_ids` is null — the Conversation's `item_ids` is the
-    authoritative ordered history source.
-
-    `item_ids` grows as turns are appended; it is the ordered list of all Item IDs
-    in the conversation so far.
+    Used by the Conversation API path. `history_item_ids` grows as turns are appended;
+    it is the ordered list of all Item IDs in the conversation so far, and mirrors the
+    same field name on the Response table for consistency.
 
     `metadata_` is an open JSON object for caller-supplied context (e.g. title,
     external IDs, tags). Not interpreted by the store.
@@ -40,7 +37,8 @@ class Conversation(Base):
     __tablename__ = "conversations"
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
-    item_ids: Mapped[list[str]] = mapped_column(
+    history_item_ids: Mapped[list[str]] = mapped_column(
+        "history_item_ids",
         JSON().with_variant(JSONB, "postgresql"),
         nullable=False,
         default=list,
@@ -80,14 +78,14 @@ class Conversation(Base):
 async def create_conversation(
     *,
     id: str,
-    item_ids: list[str] | None = None,
+    history_item_ids: list[str] | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> Conversation:
     """Insert a new Conversation row. Raises IntegrityError if the ID already exists."""
     now = _utcnow()
     return Conversation(
         id=id,
-        item_ids=item_ids or [],
+        history_item_ids=history_item_ids or [],
         metadata_=metadata,
         created_at=now,
         updated_at=now,
@@ -113,7 +111,7 @@ async def update_conversation_item_ids(
     id: str,
     item_ids: list[str],
 ) -> Conversation | None:
-    """Append item_ids to a Conversation row and update updated_at.
+    """Update history_item_ids on a Conversation row and update updated_at.
 
     Returns the updated Conversation, or None if not found.
     """
@@ -121,7 +119,7 @@ async def update_conversation_item_ids(
     conversation = result.scalar_one_or_none()
     if conversation is None:
         return None
-    conversation.item_ids = item_ids
+    conversation.history_item_ids = item_ids
     conversation.updated_at = _utcnow()
     await session.flush()
     return conversation

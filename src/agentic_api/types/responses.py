@@ -159,8 +159,9 @@ class ResponsesRequest(BaseModel):
     conversation_id: str | None = None
     tools: list[ResponsesTool] | None = None
     tool_choice: ToolChoice = Field(default_factory=AutoToolChoice)
-    store: bool = True
     stream: bool = False
+    response_store_enabled: bool = True
+    conversation_store_enabled: bool = False
     include: list[str] | None = None
     # Pass-through fields forwarded verbatim to the upstream.
     temperature: float | None = None
