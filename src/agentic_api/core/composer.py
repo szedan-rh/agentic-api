@@ -4,7 +4,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from time import time
 
-from agentic_api.core.models import (
+from agentic_api.core.normalized_events import (
     FunctionCallArgumentsDelta,
     FunctionCallDone,
     FunctionCallStarted,

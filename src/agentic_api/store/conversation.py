@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from agentic_api.database.conversation import (
-    Conversation,
     create_conversation,
     get_conversation,
     update_conversation_item_ids,
@@ -16,14 +15,11 @@ from agentic_api.database.conversation import (
 from agentic_api.database.item import Item, get_items
 from agentic_api.database.response import Response
 from agentic_api.database.session import configure_session_factory, session_transaction
+from agentic_api.store.response import ResponseMetadata
 from agentic_api.store.translator import ItemPayload
 from agentic_api.types.responses import InputItem, OutputItem
-from agentic_api.utils.common import uuid7_str
+from agentic_api.utils.common import utcnow, uuid7_str
 from agentic_api.utils.exceptions import BadInputError, ResponsesAPIError
-
-
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,7 +27,7 @@ class StoredConversation:
     conversation_id: str
     history_item_ids: list[str]
     created_at: datetime
-    metadata: dict[str, Any] = field(default_factory=dict)
+    metadata: ResponseMetadata | None = None
 
 
 @session_transaction
@@ -43,14 +39,14 @@ async def _persist_conversation_turn(
     previous_response_id: str | None,
     full_item_ids: list[str],
     metadata: dict[str, Any],
-) -> list[Any]:
+) -> list[Item | Response]:
     """Atomically write new Item rows and a Response checkpoint, then update Conversation.history_item_ids.
 
     Item and Response are built as ORM objects and returned for a single flush by
     @session_transaction. update_conversation_item_ids uses @run_in_session which joins
     the same active session, so all writes commit together.
     """
-    now = _utcnow()
+    now = utcnow()
     items = [
         Item(id=item_id, data=data, created_at=now) for item_id, data in item_tuples
     ]
@@ -59,7 +55,7 @@ async def _persist_conversation_turn(
         conversation_id=conversation_id,
         previous_response_id=previous_response_id,
         history_item_ids=full_item_ids,
-        response_metadata=metadata,
+        metadata_=metadata,
         created_at=now,
         updated_at=now,
     )
@@ -91,7 +87,6 @@ class ConversationStore:
             conversation_id=row.id,
             history_item_ids=[],
             created_at=row.created_at,
-            metadata={},
         )
 
     async def get_or_create(self, *, conversation_id: str) -> StoredConversation:
@@ -109,18 +104,19 @@ class ConversationStore:
             conversation_id=row.id,
             history_item_ids=[],
             created_at=row.created_at,
-            metadata={},
         )
 
     async def get(self, *, conversation_id: str) -> StoredConversation | None:
-        row: Conversation | None = await get_conversation(id=conversation_id)
+        row = await get_conversation(id=conversation_id)
         if row is None:
             return None
         return StoredConversation(
             conversation_id=row.id,
             history_item_ids=row.history_item_ids or [],
             created_at=row.created_at,
-            metadata=row.metadata_ or {},
+            metadata=ResponseMetadata.model_validate(row.metadata_)
+            if row.metadata_
+            else None,
         )
 
     async def put_turn(
@@ -130,7 +126,7 @@ class ConversationStore:
         response_id: str,
         previous_response_id: str | None,
         new_items: list[InputItem | OutputItem],
-        response_metadata: dict[str, Any],
+        metadata_: dict[str, Any],
     ) -> StoredConversation:
         """Persist a new conversation turn atomically.
 
@@ -145,16 +141,14 @@ class ConversationStore:
         if stored is None:
             raise BadInputError(f"Conversation not found: {conversation_id}")
 
-        new_item_ids: list[str] = []
-        item_tuples: list[tuple[str, dict[str, Any]]] = []
-        for item in new_items:
-            item_id = uuid7_str("item_")
-            new_item_ids.append(item_id)
-            item_tuples.append(
-                (item_id, ItemPayload(item=item).model_dump(mode="json"))
-            )
-
-        full_item_ids = [*stored.history_item_ids, *new_item_ids]
+        item_tuples: list[tuple[str, dict[str, Any]]] = [
+            (uuid7_str("item_"), ItemPayload(item=item).model_dump(mode="json"))
+            for item in new_items
+        ]
+        full_item_ids = [
+            *stored.history_item_ids,
+            *(item_id for item_id, _ in item_tuples),
+        ]
 
         try:
             await _persist_conversation_turn(
@@ -163,7 +157,7 @@ class ConversationStore:
                 response_id=response_id,
                 previous_response_id=previous_response_id,
                 full_item_ids=full_item_ids,
-                metadata=response_metadata,
+                metadata=metadata_,
             )
         except IntegrityError as e:
             raise BadInputError(f"Response id already exists: {response_id}") from e
@@ -176,12 +170,7 @@ class ConversationStore:
         )
 
     async def rehydrate(self, *, conversation_id: str) -> list[InputItem | OutputItem]:
-        """Return the full ordered history for a conversation.
-
-        1. Load Conversation row → get ordered history_item_ids.
-        2. Bulk-fetch Item rows.
-        3. Restore order in application code.
-        """
+        """Return the full ordered history for a conversation."""
         stored = await self.get(conversation_id=conversation_id)
         if stored is None:
             raise ResponsesAPIError(

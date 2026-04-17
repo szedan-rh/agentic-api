@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import AsyncGenerator
+from typing import Any, AsyncGenerator
 
 from pydantic_ai import Agent, ModelHTTPError, UnexpectedModelBehavior
 from pydantic_ai.models.openai import OpenAIResponsesModel
@@ -123,22 +123,9 @@ class Engine:
         )
 
     async def _resolve_conversation(self) -> StoredConversation | None:
-        """Determine which Conversation (if any) this request belongs to.
+        """Return the conversation for this request, or None if the store is disabled.
 
-        When the store is enabled (conversation_store is not None) there are three cases:
-
-        1. conversation_id is present (with or without previous_response_id) → get_or_create
-           by that ID.
-        2. Only previous_response_id is present → look up the stored response to inherit its
-           conversation_id, if any. If the response has no conversation, falls through to
-           case 3.
-        3. Both absent (or previous_response_id has no conversation) → create a new
-           conversation row with a server-generated ID.
-
-        Rehydration always uses the Response row's history_item_ids regardless of which
-        case is taken. Persist diverges: conversation is not None → put_turn; None → put_completed.
-
-        Returns None only when the store is disabled entirely.
+        Priority: conversation_id → previous_response_id's conversation → new conversation.
         """
         if self._conversation_store is None:
             return None
@@ -161,10 +148,11 @@ class Engine:
                 )
 
         # Both absent (or previous_response_id belongs to a standalone response) — new conversation.
-        conversation = await self._conversation_store.create()
-        return conversation
+        return await self._conversation_store.create()
 
-    async def _rehydrate(self) -> ResponsesRequest:
+    async def _rehydrate(
+        self, conversation: StoredConversation | None
+    ) -> ResponsesRequest:
         """Resolve the hydrated input for this request.
 
         - No previous_response_id, no conversation_id: normalise input only (first turn).
@@ -174,25 +162,33 @@ class Engine:
         """
         new_input = self._store_translator.normalize_input(self._body.input)
         if not self._body.previous_response_id:
-            if (
-                self._body.conversation_id is not None
-                and self._conversation_store is not None
-            ):
+            if conversation is not None:
                 history_items = await self._conversation_store.rehydrate(
                     conversation_id=self._body.conversation_id
                 )
                 if history_items:
-                    return self._body.model_copy(
-                        update={"input": [*history_items, *new_input]}
-                    )
+                    fields_set = self._body.model_fields_set
+                    update: dict[str, Any] = {"input": [*history_items, *new_input]}
+                    if conversation.metadata is not None:
+                        update["tools"] = self._store_translator.resolve_tools(
+                            request_tools=self._body.tools,
+                            stored_tools=conversation.metadata.effective_tools,
+                            tools_explicitly_set="tools" in fields_set,
+                        )
+                        update["tool_choice"] = (
+                            self._store_translator.resolve_tool_choice(
+                                request_tool_choice=self._body.tool_choice,
+                                stored_tool_choice=conversation.metadata.effective_tool_choice,
+                                tool_choice_explicitly_set="tool_choice" in fields_set,
+                            )
+                        )
+                    return self._body.model_copy(update=update)
             return self._body.model_copy(update={"input": new_input})
 
         stored = await self._response_store.get_or_raise(
             response_id=self._body.previous_response_id
         )
-        history_items: list[
-            InputItem | OutputItem
-        ] = await self._response_store.rehydrate(stored=stored)
+        history_items = await self._response_store.rehydrate(stored=stored)
 
         fields_set = self._body.model_fields_set
         return self._body.model_copy(
@@ -219,17 +215,12 @@ class Engine:
         response: ResponsesResponse,
         conversation: StoredConversation | None,
     ) -> None:
-        """Persist the completed turn to the appropriate store.
-
-        Branching:
-        - conversation set: Conversation API — call ConversationStore.put_turn().
-        - otherwise: Responses API — call ResponseStore.put_completed().
-        """
-        if response.status not in {"completed", "incomplete"}:
-            return
-        if not response.id:
-            return
-        if not self._body.response_store_enabled:
+        """Persist the completed turn: put_turn if conversation-scoped, put_completed otherwise."""
+        if (
+            response.status not in {"completed", "incomplete"}
+            or not response.id
+            or not self._body.response_store_enabled
+        ):
             return
 
         if conversation is not None:
@@ -250,7 +241,7 @@ class Engine:
                 response_id=response.id,
                 previous_response_id=response.previous_response_id,
                 new_items=new_items,
-                response_metadata=metadata.model_dump(mode="json"),
+                metadata_=metadata.model_dump(mode="json"),
             )
         else:
             await self._response_store.put_completed(
@@ -265,7 +256,7 @@ class Engine:
         """Resolve conversation, rehydrate history, and build a fresh Pipeline for this request."""
         response = ResponsesResponse.create_from_response_request(self._body)
         conversation = await self._resolve_conversation()
-        hydrated_body = await self._rehydrate()
+        hydrated_body = await self._rehydrate(conversation)
         run_settings = self._build_run_settings(hydrated_body)
         pipeline = Pipeline.build(response=response)
         return hydrated_body, conversation, run_settings, pipeline
@@ -278,10 +269,6 @@ class Engine:
         stream: bool,
     ) -> AsyncGenerator[StreamEvent, None]:
         failure_counters = FailureCounters()
-        phase = "stream" if stream else "non_stream"
-
-        for chunk in pipeline.composer.start():
-            yield chunk
 
         async with pipeline.run_agent(self._agent, run_settings, failure_counters) as (
             events,
@@ -292,7 +279,7 @@ class Engine:
                     yield out
             except (ModelHTTPError, UnexpectedModelBehavior) as e:
                 details = pipeline.log_failure(
-                    phase=phase,
+                    phase="stream" if stream else "non_stream",
                     e=e,
                     messages=messages,
                     counters=failure_counters,

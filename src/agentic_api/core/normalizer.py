@@ -22,7 +22,7 @@ from pydantic_ai import (
     ToolCallPartDelta,
 )
 
-from agentic_api.core.models import (
+from agentic_api.core.normalized_events import (
     FunctionCallArgumentsDelta,
     FunctionCallDone,
     FunctionCallStarted,

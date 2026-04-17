@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import DateTime, ForeignKey, String, select
@@ -9,16 +9,13 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
 
 from agentic_api.database import Base
+from agentic_api.utils.common import utcnow
 from agentic_api.database.session import (
     session_add_one,
     session_delete,
     session_get_all,
     session_get_one,
 )
-
-
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
 
 
 class Response(Base):
@@ -58,7 +55,7 @@ class Response(Base):
     )
     # Effective tool config and other metadata needed to rehydrate the next turn.
     # Stores: model, effective_tools, effective_tool_choice, effective_instructions.
-    response_metadata: Mapped[dict[str, Any] | None] = mapped_column(
+    metadata_: Mapped[dict[str, Any] | None] = mapped_column(
         "metadata",
         JSON().with_variant(JSONB, "postgresql"),
         nullable=True,
@@ -98,13 +95,13 @@ async def create_response(
     metadata: dict[str, Any] | None = None,
 ) -> Response:
     """Insert a new Response row. Raises IntegrityError if the ID already exists."""
-    now = _utcnow()
+    now = utcnow()
     return Response(
         id=id,
         conversation_id=conversation_id,
         previous_response_id=previous_response_id,
         history_item_ids=history_item_ids,
-        response_metadata=metadata,
+        metadata_=metadata,
         created_at=now,
         updated_at=now,
     )

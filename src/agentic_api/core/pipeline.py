@@ -78,6 +78,8 @@ class Pipeline:
         run_settings: AgentRunSettings,
         failure_counters: FailureCounters,
     ) -> AsyncGenerator[_ComposedEvent, None]:
+        for chunk in self.composer.start():
+            yield chunk
         async for event in agent.run_stream_events(
             output_type=[agent.output_type, DeferredToolRequests],
             message_history=run_settings["message_history"],

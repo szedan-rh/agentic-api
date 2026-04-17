@@ -5,7 +5,7 @@ from typing import Any
 
 from pydantic_ai import ModelHTTPError, UnexpectedModelBehavior
 
-from agentic_api.core.models import FunctionCallStarted
+from agentic_api.core.normalized_events import FunctionCallStarted
 
 logger = logging.getLogger(__name__)
 

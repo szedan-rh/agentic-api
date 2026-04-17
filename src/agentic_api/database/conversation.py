@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import DateTime, String, select
@@ -10,6 +10,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
 
 from agentic_api.database import Base
+from agentic_api.utils.common import utcnow
 from agentic_api.database.session import (
     run_in_session,
     session_add_one,
@@ -17,10 +18,6 @@ from agentic_api.database.session import (
     session_get_all,
     session_get_one,
 )
-
-
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
 
 
 class Conversation(Base):
@@ -82,7 +79,7 @@ async def create_conversation(
     metadata: dict[str, Any] | None = None,
 ) -> Conversation:
     """Insert a new Conversation row. Raises IntegrityError if the ID already exists."""
-    now = _utcnow()
+    now = utcnow()
     return Conversation(
         id=id,
         history_item_ids=history_item_ids or [],
@@ -120,7 +117,7 @@ async def update_conversation_item_ids(
     if conversation is None:
         return None
     conversation.history_item_ids = item_ids
-    conversation.updated_at = _utcnow()
+    conversation.updated_at = utcnow()
     await session.flush()
     return conversation
 

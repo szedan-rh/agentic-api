@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import DateTime, String, select
@@ -9,6 +9,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.types import JSON
 
 from agentic_api.database import Base
+from agentic_api.utils.common import utcnow
 from agentic_api.database.session import (
     session_add_all,
     session_add_one,
@@ -16,10 +17,6 @@ from agentic_api.database.session import (
     session_get_all,
     session_get_one,
 )
-
-
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
 
 
 class Item(Base):
@@ -51,13 +48,13 @@ class Item(Base):
 @session_add_one
 async def create_item(*, id: str, data: dict[str, Any]) -> Item:
     """Insert a new Item row. Raises IntegrityError if the ID already exists."""
-    return Item(id=id, data=data, created_at=_utcnow())
+    return Item(id=id, data=data, created_at=utcnow())
 
 
 @session_add_all
 async def create_items(items: list[tuple[str, dict[str, Any]]]) -> list[Item]:
     """Bulk-insert Item rows. Raises IntegrityError if any ID already exists."""
-    now = _utcnow()
+    now = utcnow()
     return [Item(id=item_id, data=data, created_at=now) for item_id, data in items]
 
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel
@@ -21,13 +21,9 @@ from agentic_api.types.responses import (
     ResponsesTool,
     ToolChoice,
 )
-from agentic_api.utils.common import uuid7_str
+from agentic_api.utils.common import utcnow, uuid7_str
 
 _PERSISTABLE_RESPONSE_STATUSES = frozenset({"completed", "incomplete"})
-
-
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
 
 
 class ResponseMetadata(BaseModel):
@@ -60,7 +56,7 @@ async def _persist_response_checkpoint(
     history_item_ids: list[str],
     metadata: dict[str, Any],
 ) -> list[Any]:
-    now = _utcnow()
+    now = utcnow()
     items = [
         Item(id=item_id, data=data, created_at=now) for item_id, data in item_tuples
     ]
@@ -68,7 +64,7 @@ async def _persist_response_checkpoint(
         id=response_id,
         previous_response_id=previous_response_id,
         history_item_ids=history_item_ids,
-        response_metadata=metadata,
+        metadata_=metadata,
         created_at=now,
         updated_at=now,
     )
@@ -94,7 +90,7 @@ class ResponseStore:
         if response_row is None:
             return None
 
-        metadata = ResponseMetadata.model_validate(response_row.response_metadata or {})
+        metadata = ResponseMetadata.model_validate(response_row.metadata_ or {})
         return StoredResponse(
             response_id=response_row.id,
             conversation_id=response_row.conversation_id,
