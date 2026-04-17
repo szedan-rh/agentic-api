@@ -308,3 +308,23 @@ async def test_store_false_not_persisted() -> None:
             )
         assert follow_up.status_code == 400
         assert follow_up.json()["error"]["code"] == "previous_response_not_found"
+
+
+@pytest.mark.anyio
+async def test_previous_response_id_missing_returns_error() -> None:
+    async with _e2e_client() as client:
+        resp = await client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": "hello",
+                "previous_response_id": "resp_doesnotexist",
+                "stream": False,
+                "response_store_enabled": True,
+            },
+        )
+    assert resp.status_code == 400
+    error = resp.json()["error"]
+    assert error["code"] == "previous_response_not_found"
+    assert error["param"] == "previous_response_id"
+    assert "resp_doesnotexist" in error["message"]
