@@ -87,6 +87,9 @@ class Engine:
                     response=response,
                     conversation=conversation,
                 )
+                response.conversation_id = (
+                    conversation.conversation_id if conversation is not None else None
+                )
         if response is None:
             raise BadInputError("No response generated from Engine.")
         return response
@@ -110,6 +113,9 @@ class Engine:
                     hydrated_body=hydrated_body,
                     response=pipeline.composer.response,
                     conversation=conversation,
+                )
+                pipeline.composer.response.conversation_id = (
+                    conversation.conversation_id if conversation is not None else None
                 )
             yield event
 
@@ -164,7 +170,7 @@ class Engine:
         if not self._body.previous_response_id:
             if conversation is not None:
                 history_items = await self._conversation_store.rehydrate(
-                    conversation_id=self._body.conversation_id
+                    conversation_id=conversation.conversation_id
                 )
                 if history_items:
                     fields_set = self._body.model_fields_set
@@ -224,9 +230,9 @@ class Engine:
             return
 
         if conversation is not None:
-            hydrated_input = self._store_translator.normalize_input(hydrated_body.input)
+            new_input = self._store_translator.normalize_input(self._body.input)
             new_items: list[InputItem | OutputItem] = [
-                *hydrated_input,
+                *new_input,
                 *response.output,
             ]
             metadata = ResponseMetadata(

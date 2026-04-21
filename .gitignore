@@ -16,3 +16,10 @@ build/
 .vscode/
 *.swp
 *.swo
+
+# DB
+*.db
+*.db-shm
+*db-wal
+
+*.log

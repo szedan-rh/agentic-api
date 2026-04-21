@@ -47,7 +47,7 @@ async def test_put_turn_appends_items(store: ConversationStore) -> None:
         response_id="resp_pt1",
         previous_response_id=None,
         new_items=[_user_msg("hello"), _assistant_msg("hi")],
-        response_metadata=_metadata(),
+        metadata_=_metadata(),
     )
 
     assert result.conversation_id == "conv_pt1"
@@ -63,14 +63,14 @@ async def test_put_turn_accumulates_across_turns(store: ConversationStore) -> No
         response_id="resp_acc1",
         previous_response_id=None,
         new_items=[_user_msg("turn 1"), _assistant_msg("answer 1")],
-        response_metadata=_metadata(),
+        metadata_=_metadata(),
     )
     result = await store.put_turn(
         conversation_id="conv_acc",
         response_id="resp_acc2",
         previous_response_id="resp_acc1",
         new_items=[_user_msg("turn 2"), _assistant_msg("answer 2")],
-        response_metadata=_metadata(),
+        metadata_=_metadata(),
     )
 
     assert len(result.history_item_ids) == 4
@@ -86,7 +86,7 @@ async def test_put_turn_raises_for_missing_conversation(
             response_id="resp_x",
             previous_response_id=None,
             new_items=[_user_msg("hi")],
-            response_metadata=_metadata(),
+            metadata_=_metadata(),
         )
 
 
@@ -100,7 +100,7 @@ async def test_put_turn_raises_for_duplicate_response_id(
         response_id="resp_dup",
         previous_response_id=None,
         new_items=[_user_msg("hi")],
-        response_metadata=_metadata(),
+        metadata_=_metadata(),
     )
 
     with pytest.raises(BadInputError):
@@ -109,7 +109,7 @@ async def test_put_turn_raises_for_duplicate_response_id(
             response_id="resp_dup",
             previous_response_id=None,
             new_items=[_user_msg("hi again")],
-            response_metadata=_metadata(),
+            metadata_=_metadata(),
         )
 
 
@@ -137,7 +137,7 @@ async def test_rehydrate_restores_items_in_order(store: ConversationStore) -> No
         response_id="resp_order1",
         previous_response_id=None,
         new_items=[_user_msg("first"), _assistant_msg("reply")],
-        response_metadata=_metadata(),
+        metadata_=_metadata(),
     )
 
     items = await store.rehydrate(conversation_id="conv_order")
@@ -157,14 +157,14 @@ async def test_rehydrate_multi_turn_order(store: ConversationStore) -> None:
         response_id="resp_m1",
         previous_response_id=None,
         new_items=[_user_msg("turn 1"), _assistant_msg("answer 1")],
-        response_metadata=_metadata(),
+        metadata_=_metadata(),
     )
     await store.put_turn(
         conversation_id="conv_multi",
         response_id="resp_m2",
         previous_response_id="resp_m1",
         new_items=[_user_msg("turn 2"), _assistant_msg("answer 2")],
-        response_metadata=_metadata(),
+        metadata_=_metadata(),
     )
 
     items = await store.rehydrate(conversation_id="conv_multi")

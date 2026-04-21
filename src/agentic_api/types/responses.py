@@ -198,6 +198,7 @@ class ResponsesResponse(BaseModel):
     incomplete_details: IncompleteDetails | None = None
     error: dict[str, Any] | None = None
     previous_response_id: str | None = None
+    conversation_id: str | None = None
     instructions: str | None = None
 
     def as_responses_chunk(self) -> str:

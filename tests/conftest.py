@@ -1,5 +1,6 @@
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
+from typing import Any
 
 import httpx
 import pytest
@@ -10,6 +11,18 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from agentic_api.config.runtime import RuntimeConfig
 from agentic_api.core.proxy import ProxyClientManager
 from agentic_api.entrypoints.app import create_app
+from tests.utils.replay import (
+    CassetteReplayer,
+    build_cassette_upstream,
+    cassettes_dir,
+    make_replayer,
+    make_replayer_from_multi_turn,
+)
+
+
+@pytest.fixture(scope="session")
+def anyio_backend() -> tuple[str, dict[str, Any]]:
+    return "asyncio", {}
 
 
 def build_test_runtime_config(
@@ -23,6 +36,7 @@ def build_test_runtime_config(
         gateway_workers=1,
         upstream_ready_timeout_s=5.0,
         upstream_ready_interval_s=0.1,
+        response_store_enabled=False,
     )
 
 
@@ -161,3 +175,149 @@ async def gateway_client() -> AsyncIterator[httpx.AsyncClient]:
                 yield client
         finally:
             await upstream_client.aclose()
+
+
+# ── cassette fixtures ─────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def cassette_replayer_factory() -> Callable[..., CassetteReplayer]:
+    """Return a factory: make_replayer(*filenames) → CassetteReplayer."""
+    cdir = cassettes_dir()
+    return lambda *filenames: make_replayer(*filenames, cassette_dir=cdir)
+
+
+@pytest.fixture
+def conversation_cassette_replayer_factory() -> Callable[[str], CassetteReplayer]:
+    """Factory for multi-turn conversation cassettes: factory(filename) → CassetteReplayer."""
+    cdir = cassettes_dir() / "text_only" / "conversation"
+    return lambda filename: make_replayer_from_multi_turn(filename, cassette_dir=cdir)
+
+
+@pytest.fixture
+def responses_cassette_replayer_factory() -> Callable[[str], CassetteReplayer]:
+    """Factory for multi-turn responses cassettes: factory(filename) → CassetteReplayer."""
+    cdir = cassettes_dir() / "text_only" / "responses"
+    return lambda filename: make_replayer_from_multi_turn(filename, cassette_dir=cdir)
+
+
+def _build_cassette_gateway(
+    replayer_factory: Callable[..., CassetteReplayer],
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[tuple[httpx.AsyncClient, Callable[..., None]]]:
+    """Shared implementation for cassette-backed gateway fixtures."""
+    return _cassette_gateway_context(replayer_factory, monkeypatch)
+
+
+async def _cassette_gateway_context(
+    replayer_factory: Callable[..., CassetteReplayer],
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[tuple[httpx.AsyncClient, Callable[..., None]]]:
+    from pydantic_ai.providers.openai import OpenAIProvider
+    import agentic_api.core.engine as engine_mod
+
+    replayer_holder: list[CassetteReplayer | None] = [None]
+    upstream_app = build_cassette_upstream(replayer_holder)
+
+    upstream_transport = httpx.ASGITransport(app=upstream_app)
+    upstream_client = httpx.AsyncClient(
+        transport=upstream_transport, base_url="http://upstream"
+    )
+
+    def _patched_provider(runtime_config) -> OpenAIProvider:
+        base = runtime_config.llm_api_base.rstrip("/")
+        if not base.endswith("/v1"):
+            base = f"{base}/v1"
+        return OpenAIProvider(
+            api_key="test-key", base_url=base, http_client=upstream_client
+        )
+
+    monkeypatch.setattr(engine_mod, "_build_openai_provider", _patched_provider)
+
+    runtime_config = RuntimeConfig(
+        llm_api_base="http://upstream",
+        openai_api_key="test-key",
+        gateway_host="0.0.0.0",
+        gateway_port=9000,
+        gateway_workers=1,
+        upstream_ready_timeout_s=5.0,
+        upstream_ready_interval_s=0.1,
+        db_url="sqlite+aiosqlite:///:memory:",
+        response_store_enabled=True,
+    )
+    gateway_app = create_app(runtime_config)
+
+    async with LifespanManager(gateway_app):
+        transport = httpx.ASGITransport(app=gateway_app)
+
+        def set_replayer(filename: str) -> None:
+            replayer_holder[0] = replayer_factory(filename)
+
+        try:
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://gateway"
+            ) as client:
+                yield client, set_replayer
+        finally:
+            await upstream_client.aclose()
+
+
+@pytest.fixture
+async def cassette_gateway_client(
+    cassette_replayer_factory: Callable[..., CassetteReplayer],
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[tuple[httpx.AsyncClient, Callable[..., None]]]:
+    """Yield (gateway_client, set_replayer) for cassette-based e2e tests (legacy multi-file API).
+
+    Usage::
+
+        client, use_cassettes = cassette_gateway_client
+        use_cassettes("file1.yaml", "file2.yaml")
+        resp = await client.post("/v1/responses", ...)
+    """
+
+    # Wrap the multi-filename factory into the single-filename interface expected by
+    # _cassette_gateway_context, preserving backwards compatibility.
+    def _factory(filename: str) -> CassetteReplayer:
+        return cassette_replayer_factory(filename)
+
+    async for item in _cassette_gateway_context(_factory, monkeypatch):
+        yield item
+
+
+@pytest.fixture
+async def conversation_gateway_client(
+    conversation_cassette_replayer_factory: Callable[[str], CassetteReplayer],
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[tuple[httpx.AsyncClient, Callable[[str], None]]]:
+    """Yield (gateway_client, use_cassette) backed by text_only/conversation/ cassettes.
+
+    Usage::
+
+        client, use_cassette = conversation_gateway_client
+        use_cassette("conv-two-turn-qwen3-30b-nonstreaming.yaml")
+        resp = await client.post("/v1/responses", ...)
+    """
+    async for item in _cassette_gateway_context(
+        conversation_cassette_replayer_factory, monkeypatch
+    ):
+        yield item
+
+
+@pytest.fixture
+async def responses_gateway_client(
+    responses_cassette_replayer_factory: Callable[[str], CassetteReplayer],
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[tuple[httpx.AsyncClient, Callable[[str], None]]]:
+    """Yield (gateway_client, use_cassette) backed by text_only/responses/ cassettes.
+
+    Usage::
+
+        client, use_cassette = responses_gateway_client
+        use_cassette("resp-two-turn-qwen3-30b-nonstreaming.yaml")
+        resp = await client.post("/v1/responses", ...)
+    """
+    async for item in _cassette_gateway_context(
+        responses_cassette_replayer_factory, monkeypatch
+    ):
+        yield item

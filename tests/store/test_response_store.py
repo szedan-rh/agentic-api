@@ -51,7 +51,7 @@ async def test_put_and_get_round_trip(store: ResponseStore) -> None:
 
 @pytest.mark.anyio
 async def test_put_skipped_when_store_false(store: ResponseStore) -> None:
-    request = _make_request(input="hello", store=False)
+    request = _make_request(input="hello", response_store_enabled=False)
     response = _make_response(response_id="resp_no_store")
 
     await store.put_completed(

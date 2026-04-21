@@ -1,4 +1,4 @@
-exclude: 'build/'
+exclude: 'build/|^tests/cassettes/text_only/'
 minimum_pre_commit_version: 4.4.0
 x-uv-dependency: &uv-dependency "uv==0.9.15"
 default_language_version:

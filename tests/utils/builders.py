@@ -20,13 +20,13 @@ def make_request(
     model: str = "test-model",
     input: str = "hello",
     previous_response_id: str | None = None,
-    store: bool = True,
+    response_store_enabled: bool = True,
 ) -> ResponsesRequest:
     return ResponsesRequest(
         model=model,
         input=input,
         previous_response_id=previous_response_id,
-        store=store,
+        response_store_enabled=response_store_enabled,
     )
 
 
