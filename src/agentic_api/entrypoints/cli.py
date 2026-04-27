@@ -41,6 +41,12 @@ def main(argv: list[str] | None = None) -> None:
         default=2.0,
         dest="upstream_ready_interval_s",
     )
+    parser.add_argument(
+        "--db-url",
+        default="sqlite+aiosqlite:///./agentic_api.db",
+        dest="db_url",
+        help="SQLAlchemy async database URL (e.g. sqlite+aiosqlite:///./agentic_api.db).",
+    )
 
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
     runtime_config = RuntimeConfig(
@@ -51,6 +57,7 @@ def main(argv: list[str] | None = None) -> None:
         gateway_workers=args.gateway_workers,
         upstream_ready_timeout_s=args.upstream_ready_timeout_s,
         upstream_ready_interval_s=args.upstream_ready_interval_s,
+        db_url=args.db_url,
     )
     run(runtime_config)
 

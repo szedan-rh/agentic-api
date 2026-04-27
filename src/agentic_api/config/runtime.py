@@ -1,4 +1,7 @@
-from pydantic import BaseModel, Field
+from typing import Literal
+
+from pydantic import BaseModel, Field, computed_field, field_validator
+from sqlalchemy.engine import make_url
 
 
 class RuntimeConfig(BaseModel):
@@ -24,10 +27,21 @@ class RuntimeConfig(BaseModel):
         default="sqlite+aiosqlite:///./agentic_api.db",
         description="SQLAlchemy async database URL.",
     )
-    db_dialect: str = Field(
-        default="sqlite",
-        description='Database dialect: "sqlite" or "postgresql".',
-    )
+
+    @field_validator("db_url")
+    @classmethod
+    def validate_db_url(cls, v: str) -> str:
+        url = make_url(v)
+        if not url.get_dialect().is_async:
+            raise ValueError(
+                f"db_url must use an async driver (e.g. sqlite+aiosqlite://, postgresql+asyncpg://), got: {v!r}"
+            )
+        return v
+
+    @computed_field
+    @property
+    def db_dialect(self) -> Literal["sqlite", "postgresql"]:
+        return make_url(self.db_url).get_dialect().name
 
     response_store_enabled: bool = Field(
         default=True,
