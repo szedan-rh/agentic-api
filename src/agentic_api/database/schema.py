@@ -8,7 +8,14 @@ import logging
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from agentic_api.database import Base
-from agentic_api.database import conversation, item, response  # noqa: F401
+from agentic_api.database.conversation import Conversation as Conversation
+from agentic_api.database.file import File as File
+from agentic_api.database.item import Item as Item
+from agentic_api.database.response import Response as Response
+from agentic_api.database.vector_store import VectorStoreRow as VectorStoreRow
+from agentic_api.database.vector_store_file import (
+    VectorStoreFileRow as VectorStoreFileRow,
+)
 from agentic_api.database.db_engine import postgres_advisory_lock
 
 logger = logging.getLogger(__name__)

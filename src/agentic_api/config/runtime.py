@@ -52,3 +52,20 @@ class RuntimeConfig(BaseModel):
         default=False,
         description="Log full pydantic_ai model messages on engine failure (verbose).",
     )
+
+    embedding_api_base: str | None = Field(
+        default=None,
+        description="Base URL for the embedding API (defaults to llm_api_base).",
+    )
+    embedding_model: str | None = Field(
+        default=None,
+        description="Model name for embedding requests.",
+    )
+    embedding_api_key: str | None = Field(
+        default=None,
+        description="API key for the embedding endpoint (defaults to openai_api_key).",
+    )
+    vector_store_db_path: str = Field(
+        default="./vector_store.db",
+        description="Path to the sqlite-vec database for vector store tables.",
+    )

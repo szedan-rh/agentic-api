@@ -47,6 +47,30 @@ def main(argv: list[str] | None = None) -> None:
         dest="db_url",
         help="SQLAlchemy async database URL (e.g. sqlite+aiosqlite:///./agentic_api.db).",
     )
+    parser.add_argument(
+        "--embedding-api-base",
+        default=None,
+        dest="embedding_api_base",
+        help="Base URL for the embedding API (defaults to --llm-api-base).",
+    )
+    parser.add_argument(
+        "--embedding-model",
+        default=None,
+        dest="embedding_model",
+        help="Model name for embedding requests.",
+    )
+    parser.add_argument(
+        "--embedding-api-key",
+        default=None,
+        dest="embedding_api_key",
+        help="API key for the embedding endpoint (defaults to --openai-api-key).",
+    )
+    parser.add_argument(
+        "--vector-store-db-path",
+        default="./vector_store.db",
+        dest="vector_store_db_path",
+        help="Path to the sqlite-vec database for vector store tables.",
+    )
 
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
     runtime_config = RuntimeConfig(
@@ -58,6 +82,10 @@ def main(argv: list[str] | None = None) -> None:
         upstream_ready_timeout_s=args.upstream_ready_timeout_s,
         upstream_ready_interval_s=args.upstream_ready_interval_s,
         db_url=args.db_url,
+        embedding_api_base=args.embedding_api_base,
+        embedding_model=args.embedding_model,
+        embedding_api_key=args.embedding_api_key,
+        vector_store_db_path=args.vector_store_db_path,
     )
     run(runtime_config)
 
