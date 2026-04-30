@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.settings import ModelSettings
 
+from agentic_api.types.vector_stores import FileSearchTool, FileSearchToolCall
 from agentic_api.utils.common import uuid7_str
 
 # ---------------------------------------------------------------------------
@@ -82,7 +83,7 @@ class FunctionToolCall(BaseModel):
 
 
 # Union of all valid output item types.
-OutputItem = OutputMessage | FunctionToolCall
+OutputItem = OutputMessage | FunctionToolCall | FileSearchToolCall
 
 
 # ---------------------------------------------------------------------------
@@ -109,7 +110,7 @@ class ResponseUsage(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Tool types (user-defined function tools only — no built-ins)
+# Tool types
 # ---------------------------------------------------------------------------
 
 
@@ -121,7 +122,7 @@ class FunctionTool(BaseModel):
     strict: bool | None = None
 
 
-ResponsesTool = FunctionTool
+ResponsesTool = FunctionTool | FileSearchTool
 
 
 class AutoToolChoice(BaseModel):

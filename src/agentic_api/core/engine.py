@@ -13,8 +13,10 @@ from agentic_api.core.translator import RequestInputTranslator
 from agentic_api.store.conversation import ConversationStore, StoredConversation
 from agentic_api.store.response import ResponseMetadata, ResponseStore
 from agentic_api.store.translator import StoreInputTranslator
+from agentic_api.store.vector_store import VectorStoreManager
 from agentic_api.types.responses import (
     AgentRunSettings,
+    FileSearchTool,
     InputItem,
     OutputItem,
     ResponsesRequest,
@@ -51,11 +53,13 @@ class Engine:
         response_store: ResponseStore,
         conversation_store: ConversationStore | None,
         runtime_config: RuntimeConfig,
+        vector_store_manager: VectorStoreManager | None = None,
     ) -> None:
         self._body = body
         self._response_store = response_store
         self._conversation_store = conversation_store
         self._runtime_config = runtime_config
+        self._vector_store_manager = vector_store_manager
         self._translator = RequestInputTranslator()
         self._store_translator = StoreInputTranslator()
         self._agent = Agent(
@@ -121,12 +125,37 @@ class Engine:
 
     def _build_run_settings(self, request: ResponsesRequest) -> AgentRunSettings:
         items = request.input if isinstance(request.input, list) else []
+        toolsets: list[Any] = []
+
+        if request.tools and self._vector_store_manager is not None:
+            for tool in request.tools:
+                if isinstance(tool, FileSearchTool):
+                    toolsets.append(self._build_file_search_toolset(tool))
+
         return AgentRunSettings(
             message_history=self._translator.translate(items),
             instructions=request.instructions,
-            toolsets=[],
+            toolsets=toolsets,
             usage_limits=None,
         )
+
+    def _build_file_search_toolset(self, tool_config: FileSearchTool) -> Any:
+        from pydantic_ai.toolsets.function import FunctionToolset
+
+        from agentic_api.core.file_search import FileSearchExecutor
+
+        executor = FileSearchExecutor(
+            vector_store_manager=self._vector_store_manager,
+            tool_config=tool_config,
+        )
+
+        async def file_search(query: str) -> str:
+            """Search files in the configured vector stores."""
+            return await executor.execute(query)
+
+        toolset = FunctionToolset()
+        toolset.tool(file_search)
+        return toolset
 
     async def _resolve_conversation(self) -> StoredConversation | None:
         """Return the conversation for this request, or None if the store is disabled.
