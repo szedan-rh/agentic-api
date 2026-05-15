@@ -17,11 +17,24 @@ hide:
 <a class="github-button" href="https://github.com/vllm-project/agentic-api/fork" data-show-count="true" data-icon="octicon-repo-forked" data-size="large" aria-label="Fork">Fork</a>
 </p>
 
-vLLM Agentic API provides the stateful APIs needed for real-world agentic applications — managing conversations, tool calls, and multi-turn interactions on top of [vLLM](https://github.com/vllm-project/vllm)'s high-throughput inference engine.
+vLLM Agentic API provides the stateful APIs needed for real-world agentic applications — managing conversations, tool calls, and multi-turn interactions on top of [vLLM](https://github.com/vllm-project/vllm)'s high-throughput inference engine. Built on [Praxis](https://github.com/praxis-proxy/praxis), a composable filter-based proxy framework.
 
 !!! important
 
     This project is in early development. Follow along and contribute on [GitHub](https://github.com/vllm-project/agentic-api).
+
+## Architecture
+
+The gateway is a pipeline of composable [Praxis filters](https://github.com/praxis-proxy/praxis/blob/main/docs/filters.md) configured via YAML. Each concern — state hydration, tool dispatch, agentic looping, proxying — is an independent filter that can be configured, reordered, or extended without code changes.
+
+| Filter | Role |
+|--------|------|
+| `state_hydration` | Hydrates conversation state via `previous_response_id` |
+| `agentic_loop` | Detects tool calls in model output and re-enters the inference loop |
+| `tool_dispatch` | Executes tool calls (MCP, code interpreter, file search) |
+| `responses_proxy` | Routes requests to vLLM's `/v1/responses` endpoint |
+
+SSE streaming is handled natively by Praxis/Pingora, delivering tokens to clients in real time.
 
 ## Responses API
 

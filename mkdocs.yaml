@@ -91,6 +91,7 @@ markdown_extensions:
 
 nav:
   - Home: index.md
+  - Architecture: architecture/index.md
   - API Reference: api/index.md
   - Community: community/index.md
 
