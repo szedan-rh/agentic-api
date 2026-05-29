@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use axum::Router;
 use axum::response::IntoResponse;
 use axum::routing::get;
@@ -6,6 +8,8 @@ use tokio::net::TcpListener;
 
 use agentic_core::config::Config;
 use agentic_core::proxy::ProxyState;
+use agentic_core::store::ogx::OgxStore;
+use agentic_server::handler::AppState;
 
 fn test_config(llm_url: &str) -> Config {
     Config {
@@ -34,7 +38,15 @@ async fn spawn_mock_llm() -> (String, tokio::task::JoinHandle<()>) {
 }
 
 async fn spawn_gateway(config: Config) -> (String, tokio::task::JoinHandle<()>) {
-    let state = ProxyState::new(config).unwrap();
+    let proxy = ProxyState::new(config).unwrap();
+    let client = reqwest::Client::new();
+    let ogx_store = Arc::new(OgxStore::new("http://127.0.0.1:1", client));
+    let state = Arc::new(AppState {
+        proxy,
+        max_iterations: 10,
+        response_store: ogx_store.clone(),
+        vector_search: ogx_store,
+    });
     let server_config = agentic_server::app::ServerConfig::from_env();
     let router = agentic_server::app::build_router(state, &server_config);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -51,20 +63,18 @@ async fn test_health_returns_200() {
     let config = test_config(&llm_url);
     let (gw_url, _h2) = spawn_gateway(config).await;
 
-    let resp = reqwest::get(format!("{gw_url}/health")).await.unwrap();
+    let client = reqwest::Client::new();
+    let resp = client.get(format!("{gw_url}/health")).send().await.unwrap();
     assert_eq!(resp.status(), 200);
 }
 
 #[tokio::test]
 async fn test_health_returns_200_even_when_llm_down() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let dead_addr = listener.local_addr().unwrap();
-    drop(listener);
+    let config = test_config_no_key("http://127.0.0.1:1");
+    let (gw_url, _h) = spawn_gateway(config).await;
 
-    let config = test_config_no_key(&format!("http://{dead_addr}"));
-    let (gw_url, _h2) = spawn_gateway(config).await;
-
-    let resp = reqwest::get(format!("{gw_url}/health")).await.unwrap();
+    let client = reqwest::Client::new();
+    let resp = client.get(format!("{gw_url}/health")).send().await.unwrap();
     assert_eq!(resp.status(), 200);
 }
 
@@ -74,19 +84,17 @@ async fn test_ready_returns_200_when_llm_healthy() {
     let config = test_config(&llm_url);
     let (gw_url, _h2) = spawn_gateway(config).await;
 
-    let resp = reqwest::get(format!("{gw_url}/ready")).await.unwrap();
+    let client = reqwest::Client::new();
+    let resp = client.get(format!("{gw_url}/ready")).send().await.unwrap();
     assert_eq!(resp.status(), 200);
 }
 
 #[tokio::test]
 async fn test_ready_returns_503_when_llm_unreachable() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let dead_addr = listener.local_addr().unwrap();
-    drop(listener);
+    let config = test_config_no_key("http://127.0.0.1:1");
+    let (gw_url, _h) = spawn_gateway(config).await;
 
-    let config = test_config_no_key(&format!("http://{dead_addr}"));
-    let (gw_url, _h2) = spawn_gateway(config).await;
-
-    let resp = reqwest::get(format!("{gw_url}/ready")).await.unwrap();
+    let client = reqwest::Client::new();
+    let resp = client.get(format!("{gw_url}/ready")).send().await.unwrap();
     assert_eq!(resp.status(), 503);
 }

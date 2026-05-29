@@ -1,14 +1,37 @@
+use std::sync::Arc;
+
 use agentic_core::config::Config;
 use agentic_core::error::Error;
 use agentic_core::proxy::ProxyState;
 use agentic_core::readiness::wait_llm_ready;
+use agentic_core::store::ogx::OgxStore;
 use agentic_server::app::{ServerConfig, build_router};
+use agentic_server::handler::AppState;
 use tokio::net::TcpListener;
 use tracing::info;
 
-async fn serve_gateway(config: Config, host: &str, port: u16) -> Result<(), Error> {
+fn build_app_state(config: Config, ogx_base_url: &str, max_iterations: u32) -> Result<Arc<AppState>, Error> {
+    let proxy = ProxyState::new(config)?;
+    let client = reqwest::Client::new();
+    let ogx_store = Arc::new(OgxStore::new(ogx_base_url, client));
+
+    Ok(Arc::new(AppState {
+        proxy,
+        max_iterations,
+        response_store: ogx_store.clone(),
+        vector_search: ogx_store,
+    }))
+}
+
+async fn serve_gateway(
+    config: Config,
+    host: &str,
+    port: u16,
+    ogx_base_url: &str,
+    max_iterations: u32,
+) -> Result<(), Error> {
     let addr = format!("{host}:{port}");
-    let state = ProxyState::new(config)?;
+    let state = build_app_state(config, ogx_base_url, max_iterations)?;
     let server_config = ServerConfig::from_env();
     let router = build_router(state, &server_config);
     let listener = TcpListener::bind(&addr).await?;
@@ -22,10 +45,10 @@ async fn serve_gateway(config: Config, host: &str, port: u16) -> Result<(), Erro
 /// # Errors
 ///
 /// Returns an error if LLM readiness polling fails or the server cannot bind.
-pub async fn run(config: Config, host: &str, port: u16) -> Result<(), Error> {
+pub async fn run(config: Config, host: &str, port: u16, ogx_base_url: &str, max_iterations: u32) -> Result<(), Error> {
     wait_llm_ready(&config).await?;
     info!("LLM ready: {}", config.llm_api_base);
-    serve_gateway(config, host, port).await
+    serve_gateway(config, host, port, ogx_base_url, max_iterations).await
 }
 
 /// Spawn vLLM as a subprocess and run the gateway in the foreground.
@@ -33,7 +56,14 @@ pub async fn run(config: Config, host: &str, port: u16) -> Result<(), Error> {
 /// # Errors
 ///
 /// Returns an error if vLLM fails to start or the gateway errors.
-pub async fn run_with_llm(config: Config, host: &str, port: u16, llm_args: Vec<String>) -> Result<(), Error> {
+pub async fn run_with_llm(
+    config: Config,
+    host: &str,
+    port: u16,
+    llm_args: Vec<String>,
+    ogx_base_url: &str,
+    max_iterations: u32,
+) -> Result<(), Error> {
     let mut cmd = tokio::process::Command::new("python");
     cmd.arg("-m").arg("vllm.entrypoints.openai.api_server");
     cmd.args(&llm_args);
@@ -61,7 +91,7 @@ pub async fn run_with_llm(config: Config, host: &str, port: u16, llm_args: Vec<S
     }
 
     let result = tokio::select! {
-        gateway = serve_gateway(config, host, port) => gateway,
+        gateway = serve_gateway(config, host, port, ogx_base_url, max_iterations) => gateway,
         status = child.wait() => {
             let status = status?;
             Err(Error::LlmProcessExited {

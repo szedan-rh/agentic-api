@@ -1,4 +1,5 @@
 use std::convert::Infallible;
+use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::Request;
@@ -14,7 +15,9 @@ use tokio::runtime::Runtime;
 
 use agentic_core::config::Config;
 use agentic_core::proxy::ProxyState;
+use agentic_core::store::ogx::OgxStore;
 use agentic_server::app::{ServerConfig, build_router};
+use agentic_server::handler::AppState;
 
 fn bench_config(llm_url: &str) -> Config {
     Config {
@@ -71,7 +74,15 @@ async fn spawn_llm() -> String {
 }
 
 async fn spawn_gateway(config: Config) -> String {
-    let state = ProxyState::new(config).unwrap();
+    let proxy = ProxyState::new(config).unwrap();
+    let client = reqwest::Client::new();
+    let ogx_store = Arc::new(OgxStore::new("http://127.0.0.1:1", client));
+    let state = Arc::new(AppState {
+        proxy,
+        max_iterations: 10,
+        response_store: ogx_store.clone(),
+        vector_search: ogx_store,
+    });
     let server_config = ServerConfig::from_env();
     let router = build_router(state, &server_config);
 

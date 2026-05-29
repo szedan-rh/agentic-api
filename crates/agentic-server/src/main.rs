@@ -21,6 +21,12 @@ struct CommonArgs {
 
     #[arg(long, default_value_t = 2.0, global = true)]
     llm_ready_interval_s: f64,
+
+    #[arg(long, default_value = "http://localhost:8080", global = true)]
+    ogx_base_url: String,
+
+    #[arg(long, default_value_t = 10, global = true)]
+    max_iterations: u32,
 }
 
 #[derive(Parser)]
@@ -86,7 +92,14 @@ async fn main() -> Result<(), Error> {
                 )
             })?;
             let config = build_config(normalize_base_url(&base), &common);
-            server::run(config, &common.gateway_host, common.gateway_port).await
+            server::run(
+                config,
+                &common.gateway_host,
+                common.gateway_port,
+                &common.ogx_base_url,
+                common.max_iterations,
+            )
+            .await
         }
         Some(Commands::Serve { model, port, llm_args }) => {
             if llm_api_base.is_some() {
@@ -102,7 +115,15 @@ async fn main() -> Result<(), Error> {
             args.push(port.to_string());
             args.extend(llm_args);
 
-            server::run_with_llm(config, &common.gateway_host, common.gateway_port, args).await
+            server::run_with_llm(
+                config,
+                &common.gateway_host,
+                common.gateway_port,
+                args,
+                &common.ogx_base_url,
+                common.max_iterations,
+            )
+            .await
         }
     }
 }

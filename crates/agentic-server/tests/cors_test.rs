@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use axum::Router;
 use axum::response::IntoResponse;
 use axum::routing::get;
@@ -6,6 +8,8 @@ use tokio::net::TcpListener;
 
 use agentic_core::config::Config;
 use agentic_core::proxy::ProxyState;
+use agentic_core::store::ogx::OgxStore;
+use agentic_server::handler::AppState;
 
 fn test_config(llm_url: &str) -> Config {
     Config {
@@ -27,7 +31,15 @@ async fn spawn_mock_llm() -> (String, tokio::task::JoinHandle<()>) {
 }
 
 async fn spawn_gateway(config: Config) -> (String, tokio::task::JoinHandle<()>) {
-    let state = ProxyState::new(config).unwrap();
+    let proxy = ProxyState::new(config).unwrap();
+    let client = reqwest::Client::new();
+    let ogx_store = Arc::new(OgxStore::new("http://127.0.0.1:1", client));
+    let state = Arc::new(AppState {
+        proxy,
+        max_iterations: 10,
+        response_store: ogx_store.clone(),
+        vector_search: ogx_store,
+    });
     let server_config = agentic_server::app::ServerConfig::from_env();
     let router = agentic_server::app::build_router(state, &server_config);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
