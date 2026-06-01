@@ -1,22 +1,33 @@
-use agentic_core::proxy::{ProxyBody, ProxyRequest, ProxyResponse, ProxyState, error_response};
+use std::sync::Arc;
+
 use axum::body::Body;
 use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use http::StatusCode;
-use tracing::warn;
+use bytes::Bytes;
+use tracing::{debug, error, warn};
 
-const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
+use agentic_core::proxy::ProxyState;
+use agentic_core::vector_search::VectorSearch;
+use agentic_core::vector_search::types::{ResponseBody, ResponseRequest, SearchResult, VllmOutputItem};
 
-pub async fn health() -> impl IntoResponse {
+pub struct AppState {
+    pub proxy: ProxyState,
+    pub max_iterations: u32,
+    pub vector_search: Arc<dyn VectorSearch>,
+}
+
+#[allow(clippy::unused_async)]
+pub async fn health() -> StatusCode {
     StatusCode::OK
 }
 
-pub async fn ready(State(state): State<ProxyState>) -> impl IntoResponse {
-    let base = state.config.llm_api_base.trim_end_matches('/');
+pub async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let base = state.proxy.config.llm_api_base.trim_end_matches('/');
     let url = format!("{base}/health");
 
     let mut headers = reqwest::header::HeaderMap::new();
-    if let Some(key) = state.config.openai_api_key.as_deref() {
+    if let Some(key) = state.proxy.config.openai_api_key.as_deref() {
         let trimmed = key.trim();
         if !trimmed.is_empty() {
             if let Ok(v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {trimmed}")) {
@@ -47,33 +58,237 @@ pub async fn ready(State(state): State<ProxyState>) -> impl IntoResponse {
     }
 }
 
-fn convert_response(resp: ProxyResponse) -> Response {
-    let mut builder = Response::builder().status(resp.status);
-    for (name, value) in &resp.headers {
-        builder = builder.header(name, value);
-    }
-    match resp.body {
-        ProxyBody::Full(bytes) => builder.body(Body::from(bytes)).expect("valid response"),
-        ProxyBody::Stream(stream) => builder.body(Body::from_stream(stream)).expect("valid response"),
+pub async fn handle_responses(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
+    let request: ResponseRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"error": {"message": format!("invalid request body: {e}")}}).to_string(),
+            )
+                .into_response();
+        }
+    };
+
+    let has_file_search = request.tools.iter().any(|t| t.r#type == "file_search");
+
+    if has_file_search {
+        match agentic_loop(&state, &headers, request).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                error!(error = %e, "agentic loop failed");
+                json_error_response(StatusCode::BAD_GATEWAY, &format!("agentic loop error: {e}"))
+            }
+        }
+    } else {
+        proxy_to_vllm(&state, &headers, &body, request.stream).await
     }
 }
 
-pub async fn proxy_responses(State(state): State<ProxyState>, req: axum::extract::Request) -> Response {
-    let (parts, body) = req.into_parts();
+async fn agentic_loop(
+    state: &AppState,
+    client_headers: &HeaderMap,
+    mut request: ResponseRequest,
+) -> Result<Response, agentic_core::error::Error> {
+    let vector_store_ids: Vec<String> = request
+        .tools
+        .iter()
+        .filter(|t| t.r#type == "file_search")
+        .filter_map(|t| t.vector_store_ids.clone())
+        .flatten()
+        .collect();
 
-    let Ok(body_bytes) = axum::body::to_bytes(body, MAX_BODY_SIZE).await else {
-        return convert_response(error_response(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "body_too_large",
-            "Request body too large",
-        ));
+    for iteration in 0..state.max_iterations {
+        debug!(iteration, "agentic loop iteration");
+
+        let mut loop_request = build_vllm_request(state, client_headers);
+
+        let mut body = serde_json::to_value(&request)
+            .map_err(|e| agentic_core::error::Error::Config(format!("failed to serialize request: {e}")))?;
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("stream".to_owned(), serde_json::Value::Bool(false));
+            if let Some(serde_json::Value::Array(tools)) = obj.get_mut("tools") {
+                let had_file_search = tools
+                    .iter()
+                    .any(|t| t.get("type").and_then(serde_json::Value::as_str) == Some("file_search"));
+                tools.retain(|t| t.get("type").and_then(serde_json::Value::as_str) != Some("file_search"));
+                if had_file_search {
+                    tools.push(serde_json::json!({
+                        "type": "function",
+                        "name": "file_search",
+                        "description": "Search uploaded files for relevant content. Use this when the user asks about documents or needs information from files.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {
+                                    "type": "string",
+                                    "description": "The search query to find relevant content in files"
+                                }
+                            },
+                            "required": ["query"]
+                        }
+                    }));
+                }
+            }
+        }
+
+        loop_request = loop_request.json(&body);
+
+        let resp = loop_request.send().await.map_err(agentic_core::error::Error::Proxy)?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let resp_body = resp.text().await.unwrap_or_default();
+            return Ok((
+                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+                resp_body,
+            )
+                .into_response());
+        }
+
+        let response_body: ResponseBody = resp.json().await.map_err(agentic_core::error::Error::Proxy)?;
+
+        let tool_calls: Vec<_> = response_body
+            .output
+            .iter()
+            .filter_map(|item| match item {
+                VllmOutputItem::FunctionCall {
+                    call_id,
+                    name,
+                    arguments,
+                    ..
+                } if name == "file_search" => Some((call_id.clone(), arguments.clone())),
+                _ => None,
+            })
+            .collect();
+
+        if tool_calls.is_empty() {
+            debug!(iteration, "no tool calls, returning final response");
+            let final_json = serde_json::to_string(&response_body)
+                .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_owned());
+            return Ok((StatusCode::OK, [("content-type", "application/json")], final_json).into_response());
+        }
+
+        for output_item in &response_body.output {
+            request
+                .input
+                .push(serde_json::to_value(output_item).unwrap_or_default());
+        }
+
+        for (call_id, arguments) in &tool_calls {
+            let query = extract_query(arguments);
+            debug!(%call_id, %query, "executing file_search tool call");
+
+            let results = execute_file_search(state, &vector_store_ids, &query).await;
+
+            let tool_output = serde_json::json!({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": serde_json::to_string(&results).unwrap_or_default()
+            });
+            request.input.push(tool_output);
+        }
+
+        debug!(
+            iteration,
+            tool_calls = tool_calls.len(),
+            "fed tool results back, continuing loop"
+        );
+    }
+
+    warn!(
+        max_iterations = state.max_iterations,
+        "agentic loop reached max iterations"
+    );
+    Err(agentic_core::error::Error::MaxIterations {
+        max_iterations: state.max_iterations,
+    })
+}
+
+async fn execute_file_search(state: &AppState, vector_store_ids: &[String], query: &str) -> Vec<SearchResult> {
+    let mut all_results = Vec::new();
+    for store_id in vector_store_ids {
+        match state.vector_search.search(store_id, query).await {
+            Ok(results) => all_results.extend(results),
+            Err(e) => {
+                warn!(%store_id, error = %e, "file_search failed for vector store");
+            }
+        }
+    }
+    all_results
+}
+
+fn extract_query(arguments: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()
+        .and_then(|v| v.get("query").and_then(serde_json::Value::as_str).map(String::from))
+        .unwrap_or_default()
+}
+
+async fn proxy_to_vllm(state: &AppState, client_headers: &HeaderMap, body: &Bytes, stream: bool) -> Response {
+    let req = build_vllm_request(state, client_headers).body(body.clone());
+
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            error!(error = %e, "failed to connect to vLLM");
+            return json_error_response(StatusCode::BAD_GATEWAY, &format!("vLLM connection failed: {e}"));
+        }
     };
 
-    let proxy_req = ProxyRequest {
-        headers: parts.headers,
-        body: body_bytes,
-        query: parts.uri.query().map(String::from),
-    };
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
 
-    convert_response(agentic_core::proxy::proxy_request(proxy_req, &state).await)
+    if stream {
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("text/event-stream")
+            .to_owned();
+
+        let stream = resp.bytes_stream();
+        let body = Body::from_stream(stream);
+
+        (status, [("content-type", content_type)], body).into_response()
+    } else {
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/json")
+            .to_owned();
+
+        match resp.bytes().await {
+            Ok(bytes) => (status, [("content-type", content_type)], bytes).into_response(),
+            Err(e) => json_error_response(StatusCode::BAD_GATEWAY, &format!("failed to read vLLM response: {e}")),
+        }
+    }
+}
+
+fn build_vllm_request(state: &AppState, client_headers: &HeaderMap) -> reqwest::RequestBuilder {
+    let url = format!("{}/v1/responses", state.proxy.config.llm_api_base);
+    let mut req = state
+        .proxy
+        .non_stream_client
+        .post(&url)
+        .header("content-type", "application/json");
+
+    if let Some(auth) = client_headers.get(http::header::AUTHORIZATION) {
+        if let Ok(v) = auth.to_str() {
+            req = req.header("authorization", v);
+        }
+    } else if let Some(key) = &state.proxy.config.openai_api_key {
+        req = req.header("authorization", format!("Bearer {key}"));
+    }
+
+    req
+}
+
+fn json_error_response(status: StatusCode, message: &str) -> Response {
+    (
+        status,
+        [("content-type", "application/json")],
+        serde_json::json!({"error": {"message": message}}).to_string(),
+    )
+        .into_response()
 }
