@@ -159,8 +159,32 @@ async fn agentic_loop(
 
         let mut body = serde_json::to_value(&request)
             .map_err(|e| agentic_core::error::Error::Config(format!("failed to serialize request: {e}")))?;
-        body.as_object_mut()
-            .map(|m| m.insert("stream".to_owned(), serde_json::Value::Bool(false)));
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("stream".to_owned(), serde_json::Value::Bool(false));
+            if let Some(serde_json::Value::Array(tools)) = obj.get_mut("tools") {
+                let had_file_search = tools
+                    .iter()
+                    .any(|t| t.get("type").and_then(serde_json::Value::as_str) == Some("file_search"));
+                tools.retain(|t| t.get("type").and_then(serde_json::Value::as_str) != Some("file_search"));
+                if had_file_search {
+                    tools.push(serde_json::json!({
+                        "type": "function",
+                        "name": "file_search",
+                        "description": "Search uploaded files for relevant content. Use this when the user asks about documents or needs information from files.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {
+                                    "type": "string",
+                                    "description": "The search query to find relevant content in files"
+                                }
+                            },
+                            "required": ["query"]
+                        }
+                    }));
+                }
+            }
+        }
 
         loop_request = loop_request.json(&body);
 
