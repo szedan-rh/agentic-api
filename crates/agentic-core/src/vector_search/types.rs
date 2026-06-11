@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 pub struct ResponseRequest {
     pub model: String,
     #[serde(default)]
-    pub input: Vec<serde_json::Value>,
+    pub input: ResponseInput,
     #[serde(default)]
     pub stream: bool,
     #[serde(default)]
@@ -13,6 +13,49 @@ pub struct ResponseRequest {
     pub previous_response_id: Option<String>,
     #[serde(flatten)]
     pub rest: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ResponseInput {
+    Text(String),
+    Items(Vec<serde_json::Value>),
+}
+
+impl Default for ResponseInput {
+    fn default() -> Self {
+        Self::Items(Vec::new())
+    }
+}
+
+impl ResponseInput {
+    #[must_use]
+    pub fn to_values(&self) -> Vec<serde_json::Value> {
+        match self {
+            Self::Text(text) => vec![serde_json::json!({
+                "type": "message",
+                "role": "user",
+                "content": text
+            })],
+            Self::Items(items) => items.clone(),
+        }
+    }
+
+    pub fn prepend(&mut self, mut history: Vec<serde_json::Value>) {
+        history.extend(self.to_values());
+        *self = Self::Items(history);
+    }
+
+    pub fn push(&mut self, item: serde_json::Value) {
+        match self {
+            Self::Text(_) => {
+                let mut items = self.to_values();
+                items.push(item);
+                *self = Self::Items(items);
+            }
+            Self::Items(items) => items.push(item),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

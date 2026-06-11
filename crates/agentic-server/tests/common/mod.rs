@@ -11,9 +11,12 @@ use bytes::Bytes;
 use futures::stream;
 use http::StatusCode;
 use tokio::net::TcpListener;
+use tokio::sync::Mutex;
 
 use agentic_core::config::Config;
 use agentic_core::proxy::ProxyState;
+use agentic_core::storage::{ConversationStore, ResponseStore, create_pool_with_schema};
+use agentic_core::uuid7_str;
 use agentic_core::vector_search::ogx::OgxStore;
 use agentic_server::handler::AppState;
 
@@ -40,11 +43,17 @@ pub async fn start_gateway(vllm_port: u16, ogx_port: Option<u16>, api_key: Optio
     let proxy = ProxyState::new(config).unwrap();
     let client = reqwest::Client::new();
     let ogx_store = Arc::new(OgxStore::new(&ogx_base, client));
+    let db_url = format!("sqlite:///tmp/{}.db", uuid7_str("agentic-api-test-"));
+    let pool = create_pool_with_schema(Some(&db_url)).await.unwrap();
+    let response_store = ResponseStore::new(pool.clone());
+    let conversation_store = ConversationStore::new(pool);
 
     let state = Arc::new(AppState {
         proxy,
         max_iterations: 10,
         vector_search: ogx_store,
+        response_store,
+        conversation_store,
     });
 
     let server_config = agentic_server::app::ServerConfig::from_env();
@@ -195,6 +204,52 @@ pub async fn spawn_vllm_with_tool_calls(responses: Vec<serde_json::Value>) -> (u
     });
 
     (port, handle)
+}
+
+pub async fn spawn_vllm_recording(
+    responses: Vec<serde_json::Value>,
+) -> (u16, Arc<Mutex<Vec<serde_json::Value>>>, tokio::task::JoinHandle<()>) {
+    let responses = Arc::new(responses);
+    let counter = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+
+    let app = Router::new().route("/health", get(health_handler)).route(
+        "/v1/responses",
+        post({
+            let responses = Arc::clone(&responses);
+            let counter = Arc::clone(&counter);
+            let requests_for_handler = Arc::clone(&requests);
+            move |req: Request| {
+                let responses = Arc::clone(&responses);
+                let counter = Arc::clone(&counter);
+                let requests_for_handler = Arc::clone(&requests_for_handler);
+                async move {
+                    let body_bytes = axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024)
+                        .await
+                        .unwrap_or_default();
+                    let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
+                    requests_for_handler.lock().await.push(body);
+
+                    let idx = counter.fetch_add(1, Ordering::SeqCst);
+                    let resp = responses.get(idx).unwrap_or(responses.last().unwrap());
+                    (
+                        StatusCode::OK,
+                        [("content-type", "application/json")],
+                        serde_json::to_string(resp).unwrap(),
+                    )
+                        .into_response()
+                }
+            }
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    (port, requests, handle)
 }
 
 pub async fn spawn_ogx() -> (u16, tokio::task::JoinHandle<()>) {

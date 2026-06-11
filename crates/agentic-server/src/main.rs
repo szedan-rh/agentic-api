@@ -27,6 +27,9 @@ struct CommonArgs {
 
     #[arg(long, default_value_t = 10, global = true)]
     max_iterations: u32,
+
+    #[arg(long, env = "DATABASE_URL", hide_env_values = true, global = true)]
+    database_url: Option<String>,
 }
 
 #[derive(Parser)]
@@ -98,6 +101,7 @@ async fn main() -> Result<(), Error> {
                 common.gateway_port,
                 &common.ogx_base_url,
                 common.max_iterations,
+                common.database_url.as_deref(),
             )
             .await
         }
@@ -122,6 +126,7 @@ async fn main() -> Result<(), Error> {
                 args,
                 &common.ogx_base_url,
                 common.max_iterations,
+                common.database_url.as_deref(),
             )
             .await
         }

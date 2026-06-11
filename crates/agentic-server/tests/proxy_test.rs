@@ -25,6 +25,27 @@ async fn test_non_stream_passthrough() {
 }
 
 #[tokio::test]
+async fn test_string_input_passthrough() {
+    let (vllm_port, _h) = spawn_vllm().await;
+    let (gw_addr, _) = start_gateway(vllm_port, None, Some("env-vllm-key")).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{gw_addr}/v1/responses"))
+        .json(&serde_json::json!({
+            "model": "model-a",
+            "input": "hello"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["id"], "resp_test");
+}
+
+#[tokio::test]
 async fn test_stream_passthrough() {
     let (vllm_port, _h) = spawn_vllm().await;
     let (gw_addr, _) = start_gateway(vllm_port, None, Some("env-vllm-key")).await;

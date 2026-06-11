@@ -15,6 +15,8 @@ use tokio::runtime::Runtime;
 
 use agentic_core::config::Config;
 use agentic_core::proxy::ProxyState;
+use agentic_core::storage::{ConversationStore, ResponseStore, create_pool_with_schema};
+use agentic_core::uuid7_str;
 use agentic_core::vector_search::ogx::OgxStore;
 use agentic_server::app::{ServerConfig, build_router};
 use agentic_server::handler::AppState;
@@ -77,10 +79,16 @@ async fn spawn_gateway(config: Config) -> String {
     let proxy = ProxyState::new(config).unwrap();
     let client = reqwest::Client::new();
     let ogx_store = Arc::new(OgxStore::new("http://127.0.0.1:1", client));
+    let db_url = format!("sqlite:///tmp/{}.db", uuid7_str("agentic-api-bench-"));
+    let pool = create_pool_with_schema(Some(&db_url)).await.unwrap();
+    let response_store = ResponseStore::new(pool.clone());
+    let conversation_store = ConversationStore::new(pool);
     let state = Arc::new(AppState {
         proxy,
         max_iterations: 10,
         vector_search: ogx_store,
+        response_store,
+        conversation_store,
     });
     let server_config = ServerConfig::from_env();
     let router = build_router(state, &server_config);

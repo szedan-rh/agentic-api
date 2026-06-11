@@ -32,6 +32,12 @@ pub enum Error {
     #[error("vLLM returned {status}: {body}")]
     ProxyResponse { status: u16, body: String },
 
+    #[error("database error")]
+    Database(#[from] sqlx::Error),
+
+    #[error(transparent)]
+    StateStore(#[from] crate::storage::StorageError),
+
     #[error("agentic loop exceeded {max_iterations} iterations")]
     MaxIterations { max_iterations: u32 },
 }

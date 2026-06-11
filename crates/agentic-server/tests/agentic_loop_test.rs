@@ -1,7 +1,7 @@
 #[allow(dead_code)]
 mod common;
 
-use common::{spawn_ogx, spawn_vllm, spawn_vllm_with_tool_calls, start_gateway};
+use common::{spawn_ogx, spawn_vllm, spawn_vllm_recording, spawn_vllm_with_tool_calls, start_gateway};
 
 #[tokio::test]
 async fn test_passthrough_no_tools() {
@@ -72,6 +72,105 @@ async fn test_single_file_search() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["id"], "resp_2");
     assert_eq!(body["output"][0]["type"], "message");
+}
+
+#[tokio::test]
+async fn test_file_search_streaming_rejected() {
+    let (vllm_port, _h) = spawn_vllm().await;
+    let (ogx_port, _h2) = spawn_ogx().await;
+    let (gw_addr, _) = start_gateway(vllm_port, Some(ogx_port), None).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{gw_addr}/v1/responses"))
+        .json(&serde_json::json!({
+            "model": "model-a",
+            "input": "search for something",
+            "stream": true,
+            "tools": [{"type": "file_search", "vector_store_ids": ["vs_123"]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let msg = body["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("streaming file_search"), "unexpected error: {msg}");
+}
+
+#[tokio::test]
+async fn test_previous_response_id_hydrates_history() {
+    let first_response = serde_json::json!({
+        "id": "resp_1",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "id": "msg_1",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "first answer"}]
+        }]
+    });
+
+    let second_response = serde_json::json!({
+        "id": "resp_2",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "id": "msg_2",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "second answer"}]
+        }]
+    });
+
+    let (vllm_port, requests, _h) = spawn_vllm_recording(vec![first_response, second_response]).await;
+    let (ogx_port, _h2) = spawn_ogx().await;
+    let (gw_addr, _) = start_gateway(vllm_port, Some(ogx_port), None).await;
+
+    let client = reqwest::Client::new();
+    let first = client
+        .post(format!("http://{gw_addr}/v1/responses"))
+        .json(&serde_json::json!({
+            "model": "model-a",
+            "input": "first question",
+            "tools": [{"type": "file_search", "vector_store_ids": ["vs_123"]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200);
+
+    let second = client
+        .post(format!("http://{gw_addr}/v1/responses"))
+        .json(&serde_json::json!({
+            "model": "model-a",
+            "input": "follow up",
+            "previous_response_id": "resp_1",
+            "tools": [{"type": "file_search", "vector_store_ids": ["vs_123"]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    let second_status = second.status();
+    let second_text = second.text().await.unwrap();
+    assert_eq!(second_status, 200, "second response body: {second_text}");
+
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].get("previous_response_id").is_none());
+    let input = requests[1]["input"]
+        .as_array()
+        .expect("hydrated input should be an array");
+    assert!(
+        input.len() >= 3,
+        "expected prior user/output plus follow-up input, got {input:?}"
+    );
+    assert!(input.iter().any(|item| item["content"] == "first question"));
+    assert!(input.iter().any(|item| item["content"] == "follow up"));
 }
 
 #[tokio::test]
