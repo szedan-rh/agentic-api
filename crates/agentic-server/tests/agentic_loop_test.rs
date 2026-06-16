@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 mod common;
 
 use common::{spawn_ogx, spawn_vllm, spawn_vllm_recording, spawn_vllm_with_tool_calls, start_gateway};

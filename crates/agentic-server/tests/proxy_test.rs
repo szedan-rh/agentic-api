@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 mod common;
 
 use common::{spawn_mid_stream_failure_vllm, spawn_vllm, start_gateway};
