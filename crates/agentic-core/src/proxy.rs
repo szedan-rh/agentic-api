@@ -231,6 +231,9 @@ mod tests {
             openai_api_key: Some("test-key".to_owned()),
             llm_ready_timeout_s: 5.0,
             llm_ready_interval_s: 0.1,
+            db_url: None,
+            ogx_base_url: "http://localhost:8080".to_owned(),
+            max_iterations: 10,
         }
     }
 

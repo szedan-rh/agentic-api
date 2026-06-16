@@ -1,4 +1,3 @@
-#[allow(dead_code)]
 mod common;
 
 use common::{spawn_mid_stream_failure_vllm, spawn_vllm, start_gateway};
@@ -13,7 +12,8 @@ async fn test_non_stream_passthrough() {
         .post(format!("http://{gw_addr}/v1/responses"))
         .json(&serde_json::json!({
             "model": "model-a",
-            "input": [{"role": "user", "content": "hello"}]
+            "input": [{"role": "user", "content": "hello"}],
+            "store": false
         }))
         .send()
         .await
@@ -34,7 +34,8 @@ async fn test_string_input_passthrough() {
         .post(format!("http://{gw_addr}/v1/responses"))
         .json(&serde_json::json!({
             "model": "model-a",
-            "input": "hello"
+            "input": "hello",
+            "store": false
         }))
         .send()
         .await
@@ -56,6 +57,7 @@ async fn test_stream_passthrough() {
         .json(&serde_json::json!({
             "model": "model-a",
             "input": [{"role": "user", "content": "hello"}],
+            "store": false,
             "stream": true
         }))
         .send()
@@ -77,7 +79,7 @@ async fn test_auth_injection() {
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("http://{gw_addr}/v1/responses"))
-        .json(&serde_json::json!({"model": "model-a", "input": [], "echo_auth": true}))
+        .json(&serde_json::json!({"model": "model-a", "input": [], "store": false, "echo_auth": true}))
         .send()
         .await
         .unwrap();
@@ -95,7 +97,7 @@ async fn test_client_auth_precedence() {
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("http://{gw_addr}/v1/responses"))
-        .json(&serde_json::json!({"model": "model-a", "input": [], "echo_auth": true}))
+        .json(&serde_json::json!({"model": "model-a", "input": [], "store": false, "echo_auth": true}))
         .header("authorization", "Bearer client-token")
         .send()
         .await
@@ -114,7 +116,7 @@ async fn test_vllm_http_error_passthrough() {
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("http://{gw_addr}/v1/responses"))
-        .json(&serde_json::json!({"model": "model-a", "input": [], "force_error": 429}))
+        .json(&serde_json::json!({"model": "model-a", "input": [], "store": false, "force_error": 429}))
         .send()
         .await
         .unwrap();
@@ -136,6 +138,7 @@ async fn test_mid_stream_failure_closes_cleanly() {
         .json(&serde_json::json!({
             "model": "model-a",
             "input": [],
+            "store": false,
             "stream": true
         }))
         .send()
@@ -154,7 +157,7 @@ async fn test_connect_error_maps_to_502() {
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("http://{gw_addr}/v1/responses"))
-        .json(&serde_json::json!({"model": "model-a", "input": []}))
+        .json(&serde_json::json!({"model": "model-a", "input": [], "store": false}))
         .send()
         .await
         .unwrap();

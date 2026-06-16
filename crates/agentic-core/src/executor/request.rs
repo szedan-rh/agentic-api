@@ -1,9 +1,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::config::Config;
+use crate::error::Error;
 use crate::executor::modes::{ConversationHandler, ResponseHandler};
+use crate::storage::{ConversationStore, ResponseStore, create_pool_with_schema};
 use crate::types::io::InputItem;
 use crate::types::request_response::{RequestPayload, ResponsePayload};
+use crate::vector_search::{VectorSearch, ogx::OgxStore};
 
 /// Context built by `rehydrate_conversation`, threaded through the execute pipeline.
 #[derive(Debug)]
@@ -36,15 +40,18 @@ impl RequestContext {
 /// Runtime dependencies passed into `execute()`.
 ///
 /// Owns the storage handlers, HTTP client, and LLM endpoint configuration.
-#[derive(Debug)]
+#[derive(Clone)]
 pub struct ExecutionContext {
     pub conv_handler: ConversationHandler,
     pub resp_handler: ResponseHandler,
     pub client: Arc<reqwest::Client>,
+    pub vector_search: Option<Arc<dyn VectorSearch>>,
     /// Base URL for the LLM backend, e.g. `"http://localhost:8000"`.
     pub llm_base_url: String,
     /// Bearer token forwarded from the client, if any.
     pub client_auth: Option<String>,
+    /// Maximum model/tool turns for the agentic loop.
+    pub max_iterations: u32,
     /// Maximum wait time for the next SSE chunk.  `Duration::ZERO` disables the timeout.
     /// Sourced from [`Config::streaming_chunk_timeout_s`](crate::config::Config::streaming_chunk_timeout_s).
     pub streaming_timeout: Duration,
@@ -75,30 +82,50 @@ impl ExecutionContext {
             conv_handler,
             resp_handler,
             client,
+            vector_search: None,
             llm_base_url,
             client_auth,
+            max_iterations: 10,
             streaming_timeout: Duration::from_secs(30),
         }
     }
 
     #[must_use]
-    pub fn from_config(
-        conv_handler: ConversationHandler,
-        resp_handler: ResponseHandler,
-        client: Arc<reqwest::Client>,
-        cfg: &crate::config::Config,
-        client_auth: Option<String>,
-    ) -> Self {
-        // TODO: expose `streaming_chunk_timeout_s: Option<f64>` in `Config` and read it here
-        //       once all `Config` struct literals in agentic-server use `..Config::default()`.
-        let streaming_timeout = Duration::from_secs(30);
-        Self {
+    pub fn with_vector_search(mut self, vector_search: Arc<dyn VectorSearch>, max_iterations: u32) -> Self {
+        self.vector_search = Some(vector_search);
+        self.max_iterations = max_iterations;
+        self
+    }
+
+    /// Build an `ExecutionContext` directly from [`Config`](crate::config::Config).
+    ///
+    /// Creates the database pool, both storage handlers, and an HTTP client
+    /// internally so callers don't need to depend on the storage layer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database pool cannot be opened or the schema
+    /// migration fails.
+    pub async fn from_config(cfg: &Config) -> Result<Self, Error> {
+        let db_url = cfg.db_url.as_deref().unwrap_or("sqlite://./agentic_api.db");
+        let pool = create_pool_with_schema(Some(db_url))
+            .await
+            .map_err(|e| Error::Config(format!("failed to open database '{db_url}': {e}")))?;
+
+        let conv_handler = ConversationHandler::new(ConversationStore::new(pool.clone()));
+        let resp_handler = ResponseHandler::new(ResponseStore::new(pool));
+        let client = Arc::new(reqwest::Client::new());
+        let vector_search = Arc::new(OgxStore::new(&cfg.ogx_base_url, reqwest::Client::new()));
+
+        Ok(Self {
             conv_handler,
             resp_handler,
             client,
+            vector_search: Some(vector_search),
             llm_base_url: cfg.llm_api_base.clone(),
-            client_auth,
-            streaming_timeout,
-        }
+            client_auth: cfg.openai_api_key.clone(),
+            max_iterations: cfg.max_iterations,
+            streaming_timeout: Duration::from_secs(30),
+        })
     }
 }

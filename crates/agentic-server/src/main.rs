@@ -22,14 +22,21 @@ struct CommonArgs {
     #[arg(long, default_value_t = 2.0, global = true)]
     llm_ready_interval_s: f64,
 
+    /// `SQLite` or `PostgreSQL` URL for conversation and response storage.
+    /// Defaults to a local `SQLite` file.
+    #[arg(
+        long,
+        env = "DATABASE_URL",
+        default_value = "sqlite://./agentic_api.db",
+        global = true
+    )]
+    db_url: String,
+
     #[arg(long, default_value = "http://localhost:8080", global = true)]
     ogx_base_url: String,
 
     #[arg(long, default_value_t = 10, global = true)]
     max_iterations: u32,
-
-    #[arg(long, env = "DATABASE_URL", hide_env_values = true, global = true)]
-    database_url: Option<String>,
 }
 
 #[derive(Parser)]
@@ -68,6 +75,9 @@ fn build_config(llm_api_base: String, common: &CommonArgs) -> Config {
         openai_api_key: common.openai_api_key.clone(),
         llm_ready_timeout_s: common.llm_ready_timeout_s,
         llm_ready_interval_s: common.llm_ready_interval_s,
+        db_url: Some(common.db_url.clone()),
+        ogx_base_url: normalize_base_url(&common.ogx_base_url),
+        max_iterations: common.max_iterations,
     }
 }
 
@@ -95,15 +105,7 @@ async fn main() -> Result<(), Error> {
                 )
             })?;
             let config = build_config(normalize_base_url(&base), &common);
-            server::run(
-                config,
-                &common.gateway_host,
-                common.gateway_port,
-                &common.ogx_base_url,
-                common.max_iterations,
-                common.database_url.as_deref(),
-            )
-            .await
+            server::run(config, &common.gateway_host, common.gateway_port).await
         }
         Some(Commands::Serve { model, port, llm_args }) => {
             if llm_api_base.is_some() {
@@ -111,24 +113,12 @@ async fn main() -> Result<(), Error> {
                     "--llm-api-base is only valid in standalone mode; remove it when using `serve`".to_owned(),
                 ));
             }
-
             let config = build_config(normalize_base_url(&format!("http://127.0.0.1:{port}")), &common);
-
             let mut args = vec!["--model".to_owned(), model];
             args.push("--port".to_owned());
             args.push(port.to_string());
             args.extend(llm_args);
-
-            server::run_with_llm(
-                config,
-                &common.gateway_host,
-                common.gateway_port,
-                args,
-                &common.ogx_base_url,
-                common.max_iterations,
-                common.database_url.as_deref(),
-            )
-            .await
+            server::run_with_llm(config, &common.gateway_host, common.gateway_port, args).await
         }
     }
 }

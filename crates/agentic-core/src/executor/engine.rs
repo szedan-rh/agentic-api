@@ -18,7 +18,10 @@ use crate::executor::modes::{ConversationHandler, ResponseHandler};
 use crate::executor::request::{ExecutionContext, RequestContext};
 use crate::storage::InOutItem;
 use crate::types::event::ResponseStatus;
-use crate::types::io::{InputItem, ResponsesInput, resolve_tool_choice, resolve_tools};
+use crate::types::io::{
+    FunctionTool, FunctionToolCall, FunctionToolResultMessage, InputItem, OutputItem, ResponsesInput, ResponsesTool,
+    resolve_tool_choice, resolve_tools,
+};
 use crate::types::request_response::{RequestPayload, ResponsePayload};
 use crate::utils::common::serialize_to_string;
 use crate::utils::uuid7_str;
@@ -297,6 +300,156 @@ pub async fn persist_response(
     }
 }
 
+fn contains_file_search(tools: Option<&[ResponsesTool]>) -> bool {
+    tools.is_some_and(|tools| tools.iter().any(|tool| matches!(tool, ResponsesTool::FileSearch(_))))
+}
+
+fn file_search_store_ids(tools: Option<&[ResponsesTool]>) -> Vec<String> {
+    tools
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| match tool {
+            ResponsesTool::FileSearch(tool) => Some(tool.vector_store_ids.iter().cloned()),
+            ResponsesTool::Function(_) | ResponsesTool::Unknown => None,
+        })
+        .flatten()
+        .collect()
+}
+
+fn file_search_function_tool() -> ResponsesTool {
+    ResponsesTool::Function(FunctionTool {
+        name: "file_search".to_string(),
+        description: Some("Search attached vector stores for relevant file content.".to_string()),
+        parameters: Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The search query to run against the vector store."
+                }
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        })),
+        strict: Some(true),
+    })
+}
+
+fn translate_file_search_tools(tools: Option<&[ResponsesTool]>) -> Option<Vec<ResponsesTool>> {
+    let tools = tools?;
+    let mut translated = Vec::with_capacity(tools.len());
+    for tool in tools {
+        match tool {
+            ResponsesTool::Function(tool) => translated.push(ResponsesTool::Function(tool.clone())),
+            ResponsesTool::FileSearch(_) => translated.push(file_search_function_tool()),
+            ResponsesTool::Unknown => {}
+        }
+    }
+    Some(translated)
+}
+
+fn file_search_calls(output: &[OutputItem]) -> Vec<FunctionToolCall> {
+    output
+        .iter()
+        .filter_map(|item| match item {
+            OutputItem::FunctionCall(call) if call.name == "file_search" => Some(call.clone()),
+            OutputItem::Message(_) | OutputItem::FunctionCall(_) | OutputItem::Unknown => None,
+        })
+        .collect()
+}
+
+fn query_from_arguments(arguments: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("query")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
+}
+
+fn append_input_item(input: &mut ResponsesInput, item: InputItem) {
+    let mut items = Vec::<InputItem>::from(&*input);
+    items.push(item);
+    *input = ResponsesInput::Items(items);
+}
+
+async fn run_file_search_loop(mut ctx: RequestContext, exec_ctx: &ExecutionContext) -> ExecutorResult<ResponsePayload> {
+    if ctx.original_request.stream {
+        return Err(ExecutorError::InvalidRequest(
+            "streaming file_search requests are not supported".into(),
+        ));
+    }
+
+    let Some(vector_search) = exec_ctx.vector_search.as_ref() else {
+        return Err(ExecutorError::InvalidRequest(
+            "file_search requires a configured vector search backend".into(),
+        ));
+    };
+
+    let store_ids = file_search_store_ids(ctx.enriched_request.tools.as_deref());
+    ctx.enriched_request.tools = translate_file_search_tools(ctx.enriched_request.tools.as_deref());
+    let url = exec_ctx.responses_url();
+
+    for _ in 0..exec_ctx.max_iterations {
+        let upstream_json =
+            serialize_to_string(&ctx.enriched_request.to_upstream_request(false)).map_err(ExecutorError::JsonError)?;
+        let body = fetch_response_json(upstream_json, &url, &exec_ctx.client, exec_ctx.client_auth.as_deref()).await?;
+        let acc = ResponseAccumulator::from_json(&body, ctx.conversation_id.as_deref())?;
+        let mut payload = acc.finalize(
+            &ctx.enriched_request.model,
+            ctx.original_request.previous_response_id.as_deref(),
+            ctx.original_request.instructions.as_deref(),
+        );
+
+        let tool_calls = file_search_calls(&payload.output);
+        if tool_calls.is_empty() {
+            ctx.inject_ids(&mut payload);
+            let should_persist = ctx.original_request.store
+                || ctx.original_request.previous_response_id.is_some()
+                || ctx.original_request.conversation_id.is_some();
+            if should_persist {
+                let ch = exec_ctx.conv_handler.clone();
+                let rh = exec_ctx.resp_handler.clone();
+                if let Err(e) = persist_response(payload.clone(), ctx, ch, rh).await {
+                    warn!("persist failed: {e}");
+                }
+            }
+            return Ok(payload);
+        }
+
+        for call in tool_calls {
+            let input_call = InputItem::FunctionCall(call.clone());
+            append_input_item(&mut ctx.enriched_request.input, input_call.clone());
+            ctx.new_input_items.push(input_call);
+
+            let query = query_from_arguments(&call.arguments);
+            let mut results = Vec::new();
+            for store_id in &store_ids {
+                match vector_search.search(store_id, &query).await {
+                    Ok(mut store_results) => results.append(&mut store_results),
+                    Err(err) => warn!(%store_id, %query, "file_search vector lookup failed: {err}"),
+                }
+            }
+
+            let output =
+                serialize_to_string(&serde_json::json!({ "results": results })).map_err(ExecutorError::JsonError)?;
+            let result_item = InputItem::FunctionCallOutput(FunctionToolResultMessage {
+                call_id: call.call_id,
+                output,
+            });
+            append_input_item(&mut ctx.enriched_request.input, result_item.clone());
+            ctx.new_input_items.push(result_item);
+        }
+    }
+
+    Err(ExecutorError::MaxIterations {
+        max_iterations: exec_ctx.max_iterations,
+    })
+}
+
 async fn run_blocking(ctx: RequestContext, exec_ctx: &ExecutionContext) -> ExecutorResult<ResponsePayload> {
     let url = exec_ctx.responses_url();
     // Non-streaming request: stream=false → full JSON body → from_json.
@@ -313,7 +466,10 @@ async fn run_blocking(ctx: RequestContext, exec_ctx: &ExecutionContext) -> Execu
     );
     ctx.inject_ids(&mut payload);
 
-    if ctx.original_request.store {
+    let should_persist = ctx.original_request.store
+        || ctx.original_request.previous_response_id.is_some()
+        || ctx.original_request.conversation_id.is_some();
+    if should_persist {
         let ch = exec_ctx.conv_handler.clone();
         let rh = exec_ctx.resp_handler.clone();
         if let Err(e) = persist_response(payload.clone(), ctx, ch, rh).await {
@@ -337,7 +493,11 @@ fn run_stream(ctx: RequestContext, exec_ctx: Arc<ExecutionContext>) -> BoxStream
         }
     };
 
-    let store = ctx.original_request.store;
+    // Persist when store=true, or when an ID is passed — context continuity must
+    // be preserved even if the caller sets store=false.
+    let should_persist = ctx.original_request.store
+        || ctx.original_request.previous_response_id.is_some()
+        || ctx.original_request.conversation_id.is_some();
 
     Box::pin(stream! {
         let line_stream = Box::pin(call_inference(
@@ -365,7 +525,7 @@ fn run_stream(ctx: RequestContext, exec_ctx: Arc<ExecutionContext>) -> BoxStream
                 yield payload.as_responses_chunk();
                 yield DONE_MARKER.to_string();
 
-                if store {
+                if should_persist {
                     let ch = exec_ctx.conv_handler.clone();
                     let rh = exec_ctx.resp_handler.clone();
                     if let Err(e) = persist_response(payload, ctx, ch, rh).await {
@@ -392,6 +552,7 @@ pub async fn create_conversation(exec_ctx: &ExecutionContext) -> ExecutorResult<
 /// Run the full agentic loop.
 ///
 /// Returns `Either::Left(ResponsePayload)` for non-streaming requests, or
+// TODO: replace with a builder — ExecuteRequest::new(payload, ctx).auth(token).run().await
 /// `Either::Right(BoxStream)` for streaming, each yielded `String` is an SSE
 /// line ready to forward to the client.
 ///
@@ -402,6 +563,9 @@ pub async fn execute(
     exec_ctx: Arc<ExecutionContext>,
 ) -> ExecutorResult<Either<ResponsePayload, BoxStream>> {
     let ctx = rehydrate_conversation(request, &exec_ctx).await?;
+    if contains_file_search(ctx.enriched_request.tools.as_deref()) {
+        return Ok(Either::Left(run_file_search_loop(ctx, &exec_ctx).await?));
+    }
     if ctx.original_request.stream {
         Ok(Either::Right(run_stream(ctx, exec_ctx)))
     } else {

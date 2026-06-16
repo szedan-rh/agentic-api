@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::{Map, Value};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InputTextContent {
@@ -44,15 +44,54 @@ pub struct FunctionToolResultMessage {
     pub output: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type")]
 pub enum InputItem {
     #[serde(rename = "message")]
     Message(InputMessage),
+    #[serde(rename = "function_call")]
+    FunctionCall(FunctionToolCall),
     #[serde(rename = "function_call_output")]
     FunctionCallOutput(FunctionToolResultMessage),
     #[serde(other)]
     Unknown,
+}
+
+impl<'de> Deserialize<'de> for InputItem {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let mut value = Value::deserialize(deserializer)?;
+        let Some(object) = value.as_object_mut() else {
+            return Ok(Self::Unknown);
+        };
+
+        match object.get("type").and_then(Value::as_str) {
+            Some("message") => {
+                object.remove("type");
+                serde_json::from_value(value)
+                    .map(Self::Message)
+                    .map_err(serde::de::Error::custom)
+            }
+            Some("function_call") => {
+                object.remove("type");
+                serde_json::from_value(value)
+                    .map(Self::FunctionCall)
+                    .map_err(serde::de::Error::custom)
+            }
+            Some("function_call_output") => {
+                object.remove("type");
+                serde_json::from_value(value)
+                    .map(Self::FunctionCallOutput)
+                    .map_err(serde::de::Error::custom)
+            }
+            None if object.contains_key("role") && object.contains_key("content") => serde_json::from_value(value)
+                .map(Self::Message)
+                .map_err(serde::de::Error::custom),
+            Some(_) | None => Ok(Self::Unknown),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,8 +115,10 @@ impl OutputTextContent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutputMessage {
+    #[serde(default)]
     pub id: String,
     pub role: String,
+    #[serde(default)]
     pub status: String,
     #[serde(default)]
     pub content: Vec<OutputTextContent>,
@@ -90,6 +131,25 @@ impl OutputMessage {
             role: "assistant".into(),
             status: status.into(),
             content: vec![],
+        }
+    }
+}
+
+impl From<OutputMessage> for InputMessage {
+    fn from(msg: OutputMessage) -> Self {
+        let parts = msg
+            .content
+            .into_iter()
+            .map(|c| {
+                InputContent::Text(InputTextContent {
+                    type_: c.type_,
+                    text: c.text,
+                })
+            })
+            .collect();
+        Self {
+            role: msg.role,
+            content: InputMessageContent::Parts(parts),
         }
     }
 }
@@ -137,15 +197,30 @@ pub struct ResponseUsage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionTool {
-    #[serde(rename = "type")]
-    pub type_: String,
     pub name: String,
     pub description: Option<String>,
     pub parameters: Option<Value>,
     pub strict: Option<bool>,
 }
 
-pub type ResponsesTool = FunctionTool;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileSearchTool {
+    #[serde(default)]
+    pub vector_store_ids: Vec<String>,
+    #[serde(flatten)]
+    pub rest: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ResponsesTool {
+    #[serde(rename = "function")]
+    Function(FunctionTool),
+    #[serde(rename = "file_search")]
+    FileSearch(FileSearchTool),
+    #[serde(other)]
+    Unknown,
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

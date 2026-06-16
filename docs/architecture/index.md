@@ -33,21 +33,25 @@ Pure async Rust with no framework dependency. Contains:
 
 Axum-based HTTP server that wires everything together:
 
-- **Handler** (`handler.rs`) — Request routing: runs the agentic loop if `file_search` tools are present, otherwise proxies to vLLM
+- **Handler** (`handler.rs`) — Request routing: proxies `store=false` requests to vLLM, otherwise runs the executor and its agentic loop when `file_search` tools are present
 - **App** (`app.rs`) — Router with `/health`, `/ready`, `/v1/responses` routes and CORS
-- **CLI** (`main.rs`) — Clap-based CLI with `--llm-api-base`, `--ogx-base-url`, `--max-iterations`, `--database-url`, and a `serve` subcommand that spawns vLLM as a subprocess
+- **CLI** (`main.rs`) — Clap-based CLI with `--llm-api-base`, `--ogx-base-url`, `--max-iterations`, `--db-url`, and a `serve` subcommand that spawns vLLM as a subprocess
 
 ## Request Flow
 
-### Passthrough (no tools)
+### Passthrough (`store=false`)
 
 ```
 Client → Gateway → vLLM → Gateway → Client
 ```
 
-The request is forwarded to vLLM unchanged. Streaming responses are proxied as SSE.
+Requests with `store: false` and no state IDs are forwarded to vLLM unchanged. Streaming responses are proxied as SSE.
 
-### Agentic Loop (file_search)
+### Stateful Requests
+
+Requests with `store: true`, `previous_response_id`, or `conversation_id` run through the executor so the gateway can assign response IDs and persist/replay conversation history.
+
+### Agentic Loop (`file_search`)
 
 When the request includes `tools: [{type: "file_search", vector_store_ids: [...]}]`:
 

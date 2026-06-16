@@ -1,70 +1,13 @@
-use std::sync::Arc;
+mod common;
 
-use axum::Router;
-use axum::response::IntoResponse;
-use axum::routing::get;
-use http::StatusCode;
-use tokio::net::TcpListener;
-
-use agentic_core::config::Config;
-use agentic_core::proxy::ProxyState;
-use agentic_core::storage::{ConversationStore, ResponseStore, create_pool_with_schema};
-use agentic_core::uuid7_str;
-use agentic_core::vector_search::ogx::OgxStore;
-use agentic_server::handler::AppState;
-
-fn test_config(llm_url: &str) -> Config {
-    Config {
-        llm_api_base: llm_url.to_owned(),
-        openai_api_key: None,
-        llm_ready_timeout_s: 5.0,
-        llm_ready_interval_s: 0.1,
-    }
-}
-
-async fn spawn_mock_llm() -> (String, tokio::task::JoinHandle<()>) {
-    let app = Router::new().route("/health", get(|| async { StatusCode::OK.into_response() }));
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    (format!("http://{addr}"), handle)
-}
-
-async fn spawn_gateway(config: Config) -> (String, tokio::task::JoinHandle<()>) {
-    let proxy = ProxyState::new(config).unwrap();
-    let client = reqwest::Client::new();
-    let ogx_store = Arc::new(OgxStore::new("http://127.0.0.1:1", client));
-    let db_url = format!("sqlite:///tmp/{}.db", uuid7_str("agentic-api-test-"));
-    let pool = create_pool_with_schema(Some(&db_url)).await.unwrap();
-    let response_store = ResponseStore::new(pool.clone());
-    let conversation_store = ConversationStore::new(pool);
-    let state = Arc::new(AppState {
-        proxy,
-        max_iterations: 10,
-        vector_search: ogx_store,
-        response_store,
-        conversation_store,
-    });
-    let server_config = agentic_server::app::ServerConfig::from_env();
-    let router = agentic_server::app::build_router(state, &server_config);
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let handle = tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
-    });
-    (format!("http://{addr}"), handle)
-}
+use common::{spawn_gateway, spawn_mock_llm, test_config, test_state};
 
 #[tokio::test]
 async fn test_cors_preflight_returns_200() {
     let (llm_url, _h1) = spawn_mock_llm().await;
-    let config = test_config(&llm_url);
-    let (gw_url, _h2) = spawn_gateway(config).await;
+    let (gw_url, _h2) = spawn_gateway(test_state(&test_config(&llm_url))).await;
 
-    let client = reqwest::Client::new();
-    let resp = client
+    let resp = reqwest::Client::new()
         .request(reqwest::Method::OPTIONS, format!("{gw_url}/v1/responses"))
         .header("Origin", "http://example.com")
         .header("Access-Control-Request-Method", "POST")
@@ -82,11 +25,9 @@ async fn test_cors_preflight_returns_200() {
 #[tokio::test]
 async fn test_cors_headers_on_regular_request() {
     let (llm_url, _h1) = spawn_mock_llm().await;
-    let config = test_config(&llm_url);
-    let (gw_url, _h2) = spawn_gateway(config).await;
+    let (gw_url, _h2) = spawn_gateway(test_state(&test_config(&llm_url))).await;
 
-    let client = reqwest::Client::new();
-    let resp = client
+    let resp = reqwest::Client::new()
         .post(format!("{gw_url}/v1/responses"))
         .header("Origin", "http://example.com")
         .header("Content-Type", "application/json")

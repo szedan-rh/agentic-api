@@ -1,5 +1,4 @@
 use std::convert::Infallible;
-use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::Request;
@@ -7,19 +6,18 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Router, serve};
 use bytes::Bytes;
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group};
 use futures::stream;
 use http::StatusCode;
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 
 use agentic_core::config::Config;
+use agentic_core::executor::{ConversationHandler, ExecutionContext, ResponseHandler};
 use agentic_core::proxy::ProxyState;
-use agentic_core::storage::{ConversationStore, ResponseStore, create_pool_with_schema};
-use agentic_core::uuid7_str;
-use agentic_core::vector_search::ogx::OgxStore;
-use agentic_server::app::{ServerConfig, build_router};
-use agentic_server::handler::AppState;
+use agentic_core::storage::{ConversationStore, ResponseStore};
+use agentic_server::app::{AppState, ServerConfig, build_router};
+use std::sync::Arc;
 
 fn bench_config(llm_url: &str) -> Config {
     Config {
@@ -27,6 +25,9 @@ fn bench_config(llm_url: &str) -> Config {
         openai_api_key: Some("bench-key".to_owned()),
         llm_ready_timeout_s: 5.0,
         llm_ready_interval_s: 0.1,
+        db_url: None,
+        ogx_base_url: "http://127.0.0.1:1".to_owned(),
+        max_iterations: 10,
     }
 }
 
@@ -76,20 +77,19 @@ async fn spawn_llm() -> String {
 }
 
 async fn spawn_gateway(config: Config) -> String {
-    let proxy = ProxyState::new(config).unwrap();
-    let client = reqwest::Client::new();
-    let ogx_store = Arc::new(OgxStore::new("http://127.0.0.1:1", client));
-    let db_url = format!("sqlite:///tmp/{}.db", uuid7_str("agentic-api-bench-"));
-    let pool = create_pool_with_schema(Some(&db_url)).await.unwrap();
-    let response_store = ResponseStore::new(pool.clone());
-    let conversation_store = ConversationStore::new(pool);
-    let state = Arc::new(AppState {
-        proxy,
-        max_iterations: 10,
-        vector_search: ogx_store,
-        response_store,
-        conversation_store,
-    });
+    let proxy_state = ProxyState::new(config.clone()).unwrap();
+    let exec_ctx = Arc::new(ExecutionContext::new(
+        ConversationHandler::new(ConversationStore::disabled()),
+        ResponseHandler::new(ResponseStore::disabled()),
+        Arc::new(reqwest::Client::new()),
+        config.llm_api_base.clone(),
+        config.openai_api_key.clone(),
+    ));
+    let state = AppState {
+        proxy_state,
+        exec_ctx,
+        llm_api_base: config.llm_api_base,
+    };
     let server_config = ServerConfig::from_env();
     let router = build_router(state, &server_config);
 
@@ -189,5 +189,4 @@ fn proxy_benchmarks(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, proxy_benchmarks);
-criterion_main!(benches);
+criterion_group!(proxy_benches, proxy_benchmarks);

@@ -1,4 +1,3 @@
-#[allow(dead_code)]
 mod common;
 
 use common::{spawn_ogx, spawn_vllm, spawn_vllm_recording, spawn_vllm_with_tool_calls, start_gateway};
@@ -14,7 +13,8 @@ async fn test_passthrough_no_tools() {
         .post(format!("http://{gw_addr}/v1/responses"))
         .json(&serde_json::json!({
             "model": "model-a",
-            "input": [{"role": "user", "content": "hello"}]
+            "input": [{"role": "user", "content": "hello"}],
+            "store": false
         }))
         .send()
         .await
@@ -70,7 +70,7 @@ async fn test_single_file_search() {
 
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["id"], "resp_2");
+    assert!(body["id"].as_str().unwrap_or("").starts_with("resp_"));
     assert_eq!(body["output"][0]["type"], "message");
 }
 
@@ -143,13 +143,15 @@ async fn test_previous_response_id_hydrates_history() {
         .await
         .unwrap();
     assert_eq!(first.status(), 200);
+    let first_body: serde_json::Value = first.json().await.unwrap();
+    let first_id = first_body["id"].as_str().expect("first response id");
 
     let second = client
         .post(format!("http://{gw_addr}/v1/responses"))
         .json(&serde_json::json!({
             "model": "model-a",
             "input": "follow up",
-            "previous_response_id": "resp_1",
+            "previous_response_id": first_id,
             "tools": [{"type": "file_search", "vector_store_ids": ["vs_123"]}]
         }))
         .send()
@@ -232,7 +234,7 @@ async fn test_multi_turn_tool_calls() {
 
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["id"], "resp_3");
+    assert!(body["id"].as_str().unwrap_or("").starts_with("resp_"));
 }
 
 #[tokio::test]

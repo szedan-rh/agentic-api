@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14,19 +16,57 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
 use agentic_core::config::Config;
+use agentic_core::executor::{ConversationHandler, ExecutionContext, ResponseHandler};
 use agentic_core::proxy::ProxyState;
 use agentic_core::storage::{ConversationStore, ResponseStore, create_pool_with_schema};
 use agentic_core::uuid7_str;
 use agentic_core::vector_search::ogx::OgxStore;
-use agentic_server::handler::AppState;
+use agentic_server::app::{AppState, ServerConfig, build_router};
 
-fn test_config(llm_port: u16, api_key: Option<&str>) -> Config {
+pub fn test_config(llm_url: &str) -> Config {
     Config {
-        llm_api_base: format!("http://127.0.0.1:{llm_port}"),
-        openai_api_key: api_key.map(String::from),
+        llm_api_base: llm_url.to_owned(),
+        openai_api_key: Some("test-key".to_owned()),
         llm_ready_timeout_s: 5.0,
         llm_ready_interval_s: 0.1,
+        db_url: None,
+        ogx_base_url: "http://127.0.0.1:1".to_owned(),
+        max_iterations: 10,
     }
+}
+
+pub fn test_state(config: &Config) -> AppState {
+    let exec_ctx = Arc::new(ExecutionContext::new(
+        ConversationHandler::new(ConversationStore::disabled()),
+        ResponseHandler::new(ResponseStore::disabled()),
+        Arc::new(reqwest::Client::new()),
+        config.llm_api_base.clone(),
+        config.openai_api_key.clone(),
+    ));
+    let proxy_state = ProxyState::new(config.clone()).expect("proxy state");
+    AppState {
+        proxy_state,
+        exec_ctx,
+        llm_api_base: config.llm_api_base.clone(),
+    }
+}
+
+/// Spawn a minimal mock LLM that responds to `GET /health` with 200.
+pub async fn spawn_mock_llm() -> (String, tokio::task::JoinHandle<()>) {
+    let app = Router::new().route("/health", get(|| async { StatusCode::OK.into_response() }));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), handle)
+}
+
+/// Spawn the gateway router bound to a random port.
+pub async fn spawn_gateway(state: AppState) -> (String, tokio::task::JoinHandle<()>) {
+    let router = build_router(state, &ServerConfig::from_env());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (format!("http://{addr}"), handle)
 }
 
 pub async fn start_gateway(vllm_port: u16, ogx_port: Option<u16>, api_key: Option<&str>) -> (String, u16) {
@@ -34,30 +74,37 @@ pub async fn start_gateway(vllm_port: u16, ogx_port: Option<u16>, api_key: Optio
     let port = listener.local_addr().unwrap().port();
     let addr = format!("127.0.0.1:{port}");
 
+    let llm_url = format!("http://127.0.0.1:{vllm_port}");
     let ogx_base = match ogx_port {
         Some(p) => format!("http://127.0.0.1:{p}"),
         None => "http://127.0.0.1:1".to_owned(),
     };
 
-    let config = test_config(vllm_port, api_key);
-    let proxy = ProxyState::new(config).unwrap();
-    let client = reqwest::Client::new();
-    let ogx_store = Arc::new(OgxStore::new(&ogx_base, client));
-    let db_url = format!("sqlite:///tmp/{}.db", uuid7_str("agentic-api-test-"));
-    let pool = create_pool_with_schema(Some(&db_url)).await.unwrap();
-    let response_store = ResponseStore::new(pool.clone());
-    let conversation_store = ConversationStore::new(pool);
+    let mut config = test_config(&llm_url);
+    config.openai_api_key = api_key.map(String::from);
+    config.ogx_base_url.clone_from(&ogx_base);
+    config.db_url = Some(format!("sqlite:///tmp/{}.db", uuid7_str("agentic-api-test-")));
 
-    let state = Arc::new(AppState {
-        proxy,
-        max_iterations: 10,
-        vector_search: ogx_store,
-        response_store,
-        conversation_store,
-    });
+    let proxy_state = ProxyState::new(config.clone()).unwrap();
+    let pool = create_pool_with_schema(config.db_url.as_deref()).await.unwrap();
+    let ogx_store = Arc::new(OgxStore::new(&ogx_base, reqwest::Client::new()));
+    let exec_ctx = ExecutionContext::new(
+        ConversationHandler::new(ConversationStore::new(pool.clone())),
+        ResponseHandler::new(ResponseStore::new(pool)),
+        Arc::new(reqwest::Client::new()),
+        config.llm_api_base.clone(),
+        config.openai_api_key.clone(),
+    )
+    .with_vector_search(ogx_store, config.max_iterations);
 
-    let server_config = agentic_server::app::ServerConfig::from_env();
-    let router = agentic_server::app::build_router(state, &server_config);
+    let state = AppState {
+        proxy_state,
+        exec_ctx: Arc::new(exec_ctx),
+        llm_api_base: config.llm_api_base,
+    };
+
+    let server_config = ServerConfig::from_env();
+    let router = build_router(state, &server_config);
 
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();

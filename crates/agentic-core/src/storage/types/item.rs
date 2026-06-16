@@ -5,7 +5,7 @@ use std::convert::TryFrom;
 use serde::{Deserialize, Serialize};
 
 use crate::storage::StorageError;
-use crate::types::io::{InputItem, InputMessage, InputMessageContent, OutputItem};
+use crate::types::io::{InputItem, OutputItem};
 use crate::utils::common::serialize_to_string;
 
 /// Item kind (input vs output) for storage and retrieval.
@@ -55,13 +55,11 @@ impl InOutItem {
             .filter_map(|i| match i {
                 InOutItem::Input(item) => Some(item),
                 InOutItem::Output(OutputItem::Message(msg)) => {
-                    let text = msg.content.into_iter().map(|content| content.text).collect::<String>();
-                    Some(InputItem::Message(InputMessage {
-                        role: msg.role,
-                        content: InputMessageContent::Text(text),
-                    }))
+                    // Embed history OutputMessage as an input item so the model sees prior turns.
+                    Some(InputItem::Message(msg.into()))
                 }
-                InOutItem::Output(OutputItem::FunctionCall(_) | OutputItem::Unknown) => None,
+                InOutItem::Output(OutputItem::FunctionCall(call)) => Some(InputItem::FunctionCall(call)),
+                InOutItem::Output(OutputItem::Unknown) => None,
             })
             .collect()
     }
@@ -70,7 +68,7 @@ impl InOutItem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::io::{OutputMessage, OutputTextContent};
+    use crate::types::io::{InputContent, InputMessage, InputMessageContent, OutputMessage, OutputTextContent};
 
     #[test]
     fn test_inout_item_from_input() {
@@ -122,9 +120,23 @@ mod tests {
         match &inputs[1] {
             InputItem::Message(message) => {
                 assert_eq!(message.role, "assistant");
-                assert!(matches!(&message.content, InputMessageContent::Text(text) if text == "answer"));
+                match &message.content {
+                    InputMessageContent::Parts(parts) => {
+                        assert_eq!(parts.len(), 1);
+                        match &parts[0] {
+                            InputContent::Text(t) => {
+                                assert_eq!(t.type_, "output_text");
+                                assert_eq!(t.text, "answer");
+                            }
+                            InputContent::Image(_) => panic!("expected text part"),
+                        }
+                    }
+                    InputMessageContent::Text(_) => panic!("expected parts content"),
+                }
             }
-            InputItem::FunctionCallOutput(_) | InputItem::Unknown => panic!("expected message"),
+            InputItem::FunctionCall(_) | InputItem::FunctionCallOutput(_) | InputItem::Unknown => {
+                panic!("expected message")
+            }
         }
     }
 

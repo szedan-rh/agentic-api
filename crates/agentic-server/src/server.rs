@@ -2,47 +2,26 @@ use std::sync::Arc;
 
 use agentic_core::config::Config;
 use agentic_core::error::Error;
+use agentic_core::executor::ExecutionContext;
 use agentic_core::proxy::ProxyState;
 use agentic_core::readiness::wait_llm_ready;
-use agentic_core::storage::{ConversationStore, ResponseStore, create_pool_with_schema};
-use agentic_core::vector_search::ogx::OgxStore;
-use agentic_server::app::{ServerConfig, build_router};
-use agentic_server::handler::AppState;
+use agentic_server::app::{AppState, ServerConfig, build_router};
 use tokio::net::TcpListener;
 use tracing::info;
 
-async fn build_app_state(
-    config: Config,
-    ogx_base_url: &str,
-    max_iterations: u32,
-    database_url: Option<&str>,
-) -> Result<Arc<AppState>, Error> {
-    let proxy = ProxyState::new(config)?;
-    let client = reqwest::Client::new();
-    let ogx_store = Arc::new(OgxStore::new(ogx_base_url, client));
-    let pool = create_pool_with_schema(database_url).await?;
-    let response_store = ResponseStore::new(pool.clone());
-    let conversation_store = ConversationStore::new(pool);
+async fn build_state(config: &Config) -> Result<AppState, Error> {
+    let proxy_state = ProxyState::new(config.clone())?;
+    let exec_ctx = Arc::new(ExecutionContext::from_config(config).await?);
 
-    Ok(Arc::new(AppState {
-        proxy,
-        max_iterations,
-        vector_search: ogx_store,
-        response_store,
-        conversation_store,
-    }))
+    Ok(AppState {
+        proxy_state,
+        exec_ctx,
+        llm_api_base: config.llm_api_base.clone(),
+    })
 }
 
-async fn serve_gateway(
-    config: Config,
-    host: &str,
-    port: u16,
-    ogx_base_url: &str,
-    max_iterations: u32,
-    database_url: Option<&str>,
-) -> Result<(), Error> {
+async fn serve_gateway(state: AppState, host: &str, port: u16) -> Result<(), Error> {
     let addr = format!("{host}:{port}");
-    let state = build_app_state(config, ogx_base_url, max_iterations, database_url).await?;
     let server_config = ServerConfig::from_env();
     let router = build_router(state, &server_config);
     let listener = TcpListener::bind(&addr).await?;
@@ -55,34 +34,22 @@ async fn serve_gateway(
 ///
 /// # Errors
 ///
-/// Returns an error if LLM readiness polling fails or the server cannot bind.
-pub async fn run(
-    config: Config,
-    host: &str,
-    port: u16,
-    ogx_base_url: &str,
-    max_iterations: u32,
-    database_url: Option<&str>,
-) -> Result<(), Error> {
+/// Returns an error if DB initialisation, LLM readiness polling, or the
+/// server binding fails.
+pub async fn run(config: Config, host: &str, port: u16) -> Result<(), Error> {
     wait_llm_ready(&config).await?;
     info!("LLM ready: {}", config.llm_api_base);
-    serve_gateway(config, host, port, ogx_base_url, max_iterations, database_url).await
+    let state = build_state(&config).await?;
+    serve_gateway(state, host, port).await
 }
 
 /// Spawn vLLM as a subprocess and run the gateway in the foreground.
 ///
 /// # Errors
 ///
-/// Returns an error if vLLM fails to start or the gateway errors.
-pub async fn run_with_llm(
-    config: Config,
-    host: &str,
-    port: u16,
-    llm_args: Vec<String>,
-    ogx_base_url: &str,
-    max_iterations: u32,
-    database_url: Option<&str>,
-) -> Result<(), Error> {
+/// Returns an error if vLLM fails to start, DB init fails, or the gateway
+/// errors.
+pub async fn run_with_llm(config: Config, host: &str, port: u16, llm_args: Vec<String>) -> Result<(), Error> {
     let mut cmd = tokio::process::Command::new("python");
     cmd.arg("-m").arg("vllm.entrypoints.openai.api_server");
     cmd.args(&llm_args);
@@ -94,9 +61,7 @@ pub async fn run_with_llm(
         ready = wait_llm_ready(&config) => ready,
         status = child.wait() => {
             let status = status?;
-            Err(Error::LlmProcessExited {
-                status: status.to_string(),
-            })
+            Err(Error::LlmProcessExited { status: status.to_string() })
         }
     };
 
@@ -109,13 +74,20 @@ pub async fn run_with_llm(
         }
     }
 
+    let state = match build_state(&config).await {
+        Ok(s) => s,
+        Err(err) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(err);
+        }
+    };
+
     let result = tokio::select! {
-        gateway = serve_gateway(config, host, port, ogx_base_url, max_iterations, database_url) => gateway,
+        gateway = serve_gateway(state, host, port) => gateway,
         status = child.wait() => {
             let status = status?;
-            Err(Error::LlmProcessExited {
-                status: status.to_string(),
-            })
+            Err(Error::LlmProcessExited { status: status.to_string() })
         }
     };
 

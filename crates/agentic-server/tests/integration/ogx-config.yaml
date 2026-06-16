@@ -11,7 +11,8 @@ providers:
   inference:
     - provider_id: sentence-transformers
       provider_type: inline::sentence-transformers
-      config: {}
+      config:
+        trust_remote_code: true
 
   files:
     - provider_id: localfs
