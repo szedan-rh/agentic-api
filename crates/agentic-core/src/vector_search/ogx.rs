@@ -1,7 +1,8 @@
 use async_trait::async_trait;
+use serde_json::{Map, Value};
 use tracing::debug;
 
-use super::types::{SearchResponse, SearchResult};
+use super::types::{SearchOptions, SearchResponse, SearchResult};
 use crate::error::Error;
 
 pub struct OgxStore {
@@ -19,20 +20,24 @@ impl OgxStore {
 
 #[async_trait]
 impl super::VectorSearch for OgxStore {
-    async fn search(&self, store_id: &str, query: &str) -> Result<Vec<SearchResult>, Error> {
+    async fn search(&self, store_id: &str, query: &str, options: &SearchOptions) -> Result<Vec<SearchResult>, Error> {
         let url = format!("{}/v1/vector_stores/{store_id}/search", self.base_url);
-        debug!(%url, %query, "searching vector store via OGx");
+        debug!(%url, "searching vector store via OGx");
 
-        let resp = self
-            .client
-            .post(&url)
-            .json(&serde_json::json!({
-                "query": query,
-                "max_num_results": 10
-            }))
-            .send()
-            .await
-            .map_err(Error::Store)?;
+        let mut body = Map::new();
+        body.insert("query".to_owned(), Value::String(query.to_owned()));
+        body.insert(
+            "max_num_results".to_owned(),
+            Value::from(options.max_num_results.unwrap_or(10)),
+        );
+        if let Some(filters) = &options.filters {
+            body.insert("filters".to_owned(), filters.clone());
+        }
+        if let Some(ranking_options) = &options.ranking_options {
+            body.insert("ranking_options".to_owned(), ranking_options.clone());
+        }
+
+        let resp = self.client.post(&url).json(&body).send().await.map_err(Error::Store)?;
 
         let status = resp.status();
         if !status.is_success() {

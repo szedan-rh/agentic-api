@@ -333,3 +333,51 @@ pub async fn spawn_ogx() -> (u16, tokio::task::JoinHandle<()>) {
 
     (port, handle)
 }
+
+pub async fn spawn_ogx_recording() -> (u16, Arc<Mutex<Vec<serde_json::Value>>>, tokio::task::JoinHandle<()>) {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+
+    let app = Router::new().route(
+        "/v1/vector_stores/{store_id}/search",
+        post({
+            let requests_for_handler = Arc::clone(&requests);
+            move |req: Request| {
+                let requests_for_handler = Arc::clone(&requests_for_handler);
+                async move {
+                    let body_bytes = axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024)
+                        .await
+                        .unwrap_or_default();
+                    let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
+                    requests_for_handler.lock().await.push(body);
+
+                    let response = serde_json::json!({
+                        "object": "vector_store.search_results.page",
+                        "search_query": ["test query"],
+                        "data": [{
+                            "file_id": "file_abc",
+                            "filename": "doc.txt",
+                            "score": 0.95,
+                            "attributes": {},
+                            "content": [{"type": "text", "text": "relevant content from doc"}]
+                        }],
+                        "has_more": false
+                    });
+                    (
+                        StatusCode::OK,
+                        [("content-type", "application/json")],
+                        serde_json::to_string(&response).unwrap(),
+                    )
+                        .into_response()
+                }
+            }
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    (port, requests, handle)
+}

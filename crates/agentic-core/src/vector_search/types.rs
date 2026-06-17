@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseRequest {
@@ -102,6 +103,16 @@ pub enum VllmOutputItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResponse {
     pub data: Vec<SearchResult>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SearchOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filters: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_num_results: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ranking_options: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -10,6 +10,7 @@ use std::sync::Arc;
 use async_stream::stream;
 use either::Either;
 use futures::{Stream, StreamExt};
+use serde::Deserialize;
 use tracing::warn;
 
 use crate::executor::accumulator::ResponseAccumulator;
@@ -25,6 +26,7 @@ use crate::types::io::{
 use crate::types::request_response::{RequestPayload, ResponsePayload};
 use crate::utils::common::serialize_to_string;
 use crate::utils::uuid7_str;
+use crate::vector_search::types::SearchOptions;
 
 use std::time::Duration;
 
@@ -304,16 +306,44 @@ fn contains_file_search(tools: Option<&[ResponsesTool]>) -> bool {
     tools.is_some_and(|tools| tools.iter().any(|tool| matches!(tool, ResponsesTool::FileSearch(_))))
 }
 
-fn file_search_store_ids(tools: Option<&[ResponsesTool]>) -> Vec<String> {
-    tools
-        .into_iter()
-        .flatten()
-        .filter_map(|tool| match tool {
-            ResponsesTool::FileSearch(tool) => Some(tool.vector_store_ids.iter().cloned()),
-            ResponsesTool::Function(_) | ResponsesTool::Unknown => None,
-        })
-        .flatten()
-        .collect()
+#[derive(Clone)]
+struct FileSearchConfig {
+    store_ids: Vec<String>,
+    options: SearchOptions,
+}
+
+fn file_search_config(tools: Option<&[ResponsesTool]>) -> ExecutorResult<FileSearchConfig> {
+    let mut store_ids = Vec::new();
+    let mut options = None::<SearchOptions>;
+
+    for tool in tools.into_iter().flatten() {
+        match tool {
+            ResponsesTool::FileSearch(tool) => {
+                store_ids.extend(tool.vector_store_ids.iter().filter(|id| !id.is_empty()).cloned());
+                if options
+                    .as_ref()
+                    .is_some_and(|existing| existing != &tool.search_options)
+                {
+                    return Err(ExecutorError::InvalidRequest(
+                        "multiple file_search tools with different search options are not supported".into(),
+                    ));
+                }
+                options.get_or_insert_with(|| tool.search_options.clone());
+            }
+            ResponsesTool::Function(_) | ResponsesTool::Unknown => {}
+        }
+    }
+
+    if store_ids.is_empty() {
+        return Err(ExecutorError::InvalidRequest(
+            "file_search requires at least one vector_store_ids entry".into(),
+        ));
+    }
+
+    Ok(FileSearchConfig {
+        store_ids,
+        options: options.unwrap_or_default(),
+    })
 }
 
 fn file_search_function_tool() -> ResponsesTool {
@@ -348,26 +378,44 @@ fn translate_file_search_tools(tools: Option<&[ResponsesTool]>) -> Option<Vec<Re
     Some(translated)
 }
 
-fn file_search_calls(output: &[OutputItem]) -> Vec<FunctionToolCall> {
-    output
-        .iter()
-        .filter_map(|item| match item {
-            OutputItem::FunctionCall(call) if call.name == "file_search" => Some(call.clone()),
-            OutputItem::Message(_) | OutputItem::FunctionCall(_) | OutputItem::Unknown => None,
-        })
-        .collect()
+fn file_search_calls(output: &[OutputItem]) -> ExecutorResult<Vec<FunctionToolCall>> {
+    let mut file_search_calls = Vec::new();
+    let mut other_tool_names = Vec::new();
+
+    for item in output {
+        match item {
+            OutputItem::FunctionCall(call) if call.name == "file_search" => file_search_calls.push(call.clone()),
+            OutputItem::FunctionCall(call) => other_tool_names.push(call.name.clone()),
+            OutputItem::Message(_) | OutputItem::Unknown => {}
+        }
+    }
+
+    if !file_search_calls.is_empty() && !other_tool_names.is_empty() {
+        return Err(ExecutorError::ToolExecution(format!(
+            "mixed tool calls are not supported in file_search loop: {}",
+            other_tool_names.join(", ")
+        )));
+    }
+
+    Ok(file_search_calls)
 }
 
-fn query_from_arguments(arguments: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(arguments)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("query")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-        })
-        .unwrap_or_default()
+#[derive(Deserialize)]
+struct FileSearchArguments {
+    query: String,
+}
+
+fn query_from_arguments(arguments: &str) -> ExecutorResult<String> {
+    let args = serde_json::from_str::<FileSearchArguments>(arguments)
+        .map_err(|err| ExecutorError::ToolExecution(format!("invalid file_search arguments: {err}")))?;
+
+    if args.query.trim().is_empty() {
+        return Err(ExecutorError::ToolExecution(
+            "file_search query argument is required".into(),
+        ));
+    }
+
+    Ok(args.query)
 }
 
 fn append_input_item(input: &mut ResponsesInput, item: InputItem) {
@@ -389,7 +437,7 @@ async fn run_file_search_loop(mut ctx: RequestContext, exec_ctx: &ExecutionConte
         ));
     };
 
-    let store_ids = file_search_store_ids(ctx.enriched_request.tools.as_deref());
+    let file_search = file_search_config(ctx.enriched_request.tools.as_deref())?;
     ctx.enriched_request.tools = translate_file_search_tools(ctx.enriched_request.tools.as_deref());
     let url = exec_ctx.responses_url();
 
@@ -404,7 +452,7 @@ async fn run_file_search_loop(mut ctx: RequestContext, exec_ctx: &ExecutionConte
             ctx.original_request.instructions.as_deref(),
         );
 
-        let tool_calls = file_search_calls(&payload.output);
+        let tool_calls = file_search_calls(&payload.output)?;
         if tool_calls.is_empty() {
             ctx.inject_ids(&mut payload);
             let should_persist = ctx.original_request.store
@@ -425,10 +473,10 @@ async fn run_file_search_loop(mut ctx: RequestContext, exec_ctx: &ExecutionConte
             append_input_item(&mut ctx.enriched_request.input, input_call.clone());
             ctx.new_input_items.push(input_call);
 
-            let query = query_from_arguments(&call.arguments);
+            let query = query_from_arguments(&call.arguments)?;
             let mut results = Vec::new();
-            for store_id in &store_ids {
-                match vector_search.search(store_id, &query).await {
+            for store_id in &file_search.store_ids {
+                match vector_search.search(store_id, &query, &file_search.options).await {
                     Ok(mut store_results) => results.append(&mut store_results),
                     Err(err) => {
                         return Err(ExecutorError::ToolExecution(format!(

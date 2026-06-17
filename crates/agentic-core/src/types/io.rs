@@ -1,6 +1,8 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
+use crate::vector_search::types::SearchOptions;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InputTextContent {
     #[serde(rename = "type")]
@@ -207,6 +209,8 @@ pub struct FunctionTool {
 pub struct FileSearchTool {
     #[serde(default)]
     pub vector_store_ids: Vec<String>,
+    #[serde(default, flatten)]
+    pub search_options: SearchOptions,
     #[serde(flatten)]
     pub rest: Map<String, Value>,
 }
