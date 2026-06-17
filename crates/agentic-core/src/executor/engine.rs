@@ -430,7 +430,11 @@ async fn run_file_search_loop(mut ctx: RequestContext, exec_ctx: &ExecutionConte
             for store_id in &store_ids {
                 match vector_search.search(store_id, &query).await {
                     Ok(mut store_results) => results.append(&mut store_results),
-                    Err(err) => warn!(%store_id, %query, "file_search vector lookup failed: {err}"),
+                    Err(err) => {
+                        return Err(ExecutorError::ToolExecution(format!(
+                            "file_search vector lookup failed for vector store {store_id}: {err}"
+                        )));
+                    }
                 }
             }
 

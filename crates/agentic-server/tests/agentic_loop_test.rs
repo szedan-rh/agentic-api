@@ -76,6 +76,57 @@ async fn test_single_file_search() {
 }
 
 #[tokio::test]
+async fn test_file_search_backend_failure_returns_error() {
+    let tool_call_response = serde_json::json!({
+        "id": "resp_1",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_1",
+            "name": "file_search",
+            "arguments": "{\"query\": \"test query\"}",
+            "status": "completed"
+        }]
+    });
+
+    let final_response = serde_json::json!({
+        "id": "resp_2",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "answer without search context"}]
+        }]
+    });
+
+    let (vllm_port, _h) = spawn_vllm_with_tool_calls(vec![tool_call_response, final_response]).await;
+    let (gw_addr, _) = start_gateway(vllm_port, None, None).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{gw_addr}/v1/responses"))
+        .json(&serde_json::json!({
+            "model": "model-a",
+            "input": "search for something",
+            "tools": [{"type": "file_search", "vector_store_ids": ["vs_123"]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 502);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let msg = body["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("file_search vector lookup failed"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[tokio::test]
 async fn test_file_search_streaming_rejected() {
     let (vllm_port, _h) = spawn_vllm().await;
     let (ogx_port, _h2) = spawn_ogx().await;

@@ -1,3 +1,8 @@
+#[allow(dead_code)]
+mod common;
+
+use common::{spawn_vllm_recording, start_gateway_with_ogx_base};
+
 fn ogx_base_url() -> Option<String> {
     std::env::var("OGX_BASE_URL").ok()
 }
@@ -78,6 +83,82 @@ async fn upload_and_attach(client: &reqwest::Client, ogx_url: &str, vs_id: &str)
     );
 }
 
+async fn assert_gateway_file_search_uses_ogx(client: &reqwest::Client, ogx_url: &str, vs_id: &str) {
+    let tool_call_response = serde_json::json!({
+        "id": "resp_1",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_1",
+            "name": "file_search",
+            "arguments": "{\"query\": \"memory safety ownership\"}",
+            "status": "completed"
+        }]
+    });
+    let final_response = serde_json::json!({
+        "id": "resp_2",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Rust uses ownership and borrowing."}]
+        }]
+    });
+    let (vllm_port, requests, _vllm_handle) = spawn_vllm_recording(vec![tool_call_response, final_response]).await;
+    let (gateway_addr, _) = start_gateway_with_ogx_base(vllm_port, ogx_url, None).await;
+
+    let gateway_resp = client
+        .post(format!("http://{gateway_addr}/v1/responses"))
+        .json(&serde_json::json!({
+            "model": "model-a",
+            "input": "How does Rust provide memory safety?",
+            "tools": [{"type": "file_search", "vector_store_ids": [vs_id]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        gateway_resp.status().is_success(),
+        "gateway file_search failed: {}",
+        gateway_resp.text().await.unwrap_or_default()
+    );
+
+    let requests = requests.lock().await;
+    assert_eq!(
+        requests.len(),
+        2,
+        "gateway should call vLLM before and after OGX search"
+    );
+
+    let first_tools = requests[0]["tools"]
+        .as_array()
+        .expect("first request should include tools");
+    assert_eq!(first_tools[0]["type"], "function");
+    assert_eq!(first_tools[0]["name"], "file_search");
+
+    let second_input = requests[1]["input"]
+        .as_array()
+        .expect("second request should include input items");
+    let tool_output = second_input
+        .iter()
+        .find(|item| item["type"] == "function_call_output")
+        .expect("gateway should append function_call_output");
+    let output = tool_output["output"]
+        .as_str()
+        .expect("tool output should be a JSON string");
+    let output_json: serde_json::Value = serde_json::from_str(output).expect("tool output should parse as JSON");
+    let gateway_results = output_json["results"]
+        .as_array()
+        .expect("tool output should include results");
+    assert!(
+        !gateway_results.is_empty(),
+        "gateway should pass OGX search results back to vLLM"
+    );
+}
+
 #[tokio::test]
 async fn test_vector_search_with_ogx() {
     let Some(ogx_url) = ogx_base_url() else {
@@ -123,4 +204,6 @@ async fn test_vector_search_with_ogx() {
 
     eprintln!("Search returned {} results, top score: {score:.3}", data.len());
     eprintln!("Top result: {content}");
+
+    assert_gateway_file_search_uses_ogx(&client, &ogx_url, &vs_id).await;
 }

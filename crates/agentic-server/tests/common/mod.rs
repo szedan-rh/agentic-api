@@ -68,24 +68,28 @@ pub async fn spawn_gateway(state: AppState) -> (String, tokio::task::JoinHandle<
 }
 
 pub async fn start_gateway(vllm_port: u16, ogx_port: Option<u16>, api_key: Option<&str>) -> (String, u16) {
+    let ogx_base = match ogx_port {
+        Some(p) => format!("http://127.0.0.1:{p}"),
+        None => "http://127.0.0.1:1".to_owned(),
+    };
+    start_gateway_with_ogx_base(vllm_port, &ogx_base, api_key).await
+}
+
+pub async fn start_gateway_with_ogx_base(vllm_port: u16, ogx_base: &str, api_key: Option<&str>) -> (String, u16) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let addr = format!("127.0.0.1:{port}");
 
     let llm_url = format!("http://127.0.0.1:{vllm_port}");
-    let ogx_base = match ogx_port {
-        Some(p) => format!("http://127.0.0.1:{p}"),
-        None => "http://127.0.0.1:1".to_owned(),
-    };
 
     let mut config = test_config(&llm_url);
     config.openai_api_key = api_key.map(String::from);
-    config.ogx_base_url.clone_from(&ogx_base);
+    config.ogx_base_url = ogx_base.to_owned();
     config.db_url = Some(format!("sqlite:///tmp/{}.db", uuid7_str("agentic-api-test-")));
 
     let proxy_state = ProxyState::new(config.clone()).unwrap();
     let pool = create_pool_with_schema(config.db_url.as_deref()).await.unwrap();
-    let ogx_store = Arc::new(OgxStore::new(&ogx_base, reqwest::Client::new()));
+    let ogx_store = Arc::new(OgxStore::new(ogx_base, reqwest::Client::new()));
     let exec_ctx = ExecutionContext::new(
         ConversationHandler::new(ConversationStore::new(pool.clone())),
         ResponseHandler::new(ResponseStore::new(pool)),
