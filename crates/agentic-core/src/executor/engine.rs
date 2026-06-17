@@ -386,7 +386,7 @@ fn file_search_calls(output: &[OutputItem]) -> ExecutorResult<Vec<FunctionToolCa
         match item {
             OutputItem::FunctionCall(call) if call.name == "file_search" => file_search_calls.push(call.clone()),
             OutputItem::FunctionCall(call) => other_tool_names.push(call.name.clone()),
-            OutputItem::Message(_) | OutputItem::Unknown => {}
+            OutputItem::Message(_) | OutputItem::Reasoning(_) | OutputItem::Unknown => {}
         }
     }
 
