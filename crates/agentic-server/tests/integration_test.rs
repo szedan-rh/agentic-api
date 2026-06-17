@@ -2,9 +2,58 @@
 mod common;
 
 use common::{spawn_vllm_recording, start_gateway_with_ogx_base};
+use serde::Deserialize;
+use serde_json::Value;
+
+const FILE_SEARCH_VLLM_CASSETTE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/cassettes/file_search/vllm-file-search-openai-gpt-oss-20b.json"
+);
+
+#[derive(Debug, Deserialize)]
+struct VllmCassette {
+    turns: Vec<VllmTurn>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VllmTurn {
+    response: VllmResponse,
+}
+
+#[derive(Debug, Deserialize)]
+struct VllmResponse {
+    status_code: u16,
+    body: Value,
+}
 
 fn ogx_base_url() -> Option<String> {
     std::env::var("OGX_BASE_URL").ok()
+}
+
+fn load_file_search_vllm_responses() -> Vec<Value> {
+    let text = std::fs::read_to_string(FILE_SEARCH_VLLM_CASSETTE)
+        .unwrap_or_else(|err| panic!("failed to read cassette {FILE_SEARCH_VLLM_CASSETTE}: {err}"));
+    let cassette: VllmCassette = serde_json::from_str(&text)
+        .unwrap_or_else(|err| panic!("failed to parse cassette {FILE_SEARCH_VLLM_CASSETTE}: {err}"));
+    cassette
+        .turns
+        .into_iter()
+        .map(|turn| {
+            assert_eq!(turn.response.status_code, 200, "cassette response should be successful");
+            turn.response.body
+        })
+        .collect()
+}
+
+fn output_text(body: &Value) -> String {
+    body["output"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item["content"].as_array())
+        .flatten()
+        .filter_map(|content| content["text"].as_str())
+        .collect()
 }
 
 async fn find_embedding_model(client: &reqwest::Client, ogx_url: &str) -> (String, u64) {
@@ -84,30 +133,7 @@ async fn upload_and_attach(client: &reqwest::Client, ogx_url: &str, vs_id: &str)
 }
 
 async fn assert_gateway_file_search_uses_ogx(client: &reqwest::Client, ogx_url: &str, vs_id: &str) {
-    let tool_call_response = serde_json::json!({
-        "id": "resp_1",
-        "object": "response",
-        "status": "completed",
-        "output": [{
-            "type": "function_call",
-            "id": "fc_1",
-            "call_id": "call_1",
-            "name": "file_search",
-            "arguments": "{\"query\": \"memory safety ownership\"}",
-            "status": "completed"
-        }]
-    });
-    let final_response = serde_json::json!({
-        "id": "resp_2",
-        "object": "response",
-        "status": "completed",
-        "output": [{
-            "type": "message",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": "Rust uses ownership and borrowing."}]
-        }]
-    });
-    let (vllm_port, requests, _vllm_handle) = spawn_vllm_recording(vec![tool_call_response, final_response]).await;
+    let (vllm_port, requests, _vllm_handle) = spawn_vllm_recording(load_file_search_vllm_responses()).await;
     let (gateway_addr, _) = start_gateway_with_ogx_base(vllm_port, ogx_url, None).await;
 
     let gateway_resp = client
@@ -120,10 +146,17 @@ async fn assert_gateway_file_search_uses_ogx(client: &reqwest::Client, ogx_url: 
         .send()
         .await
         .unwrap();
+    let gateway_status = gateway_resp.status();
+    let gateway_body: Value = gateway_resp.json().await.unwrap();
     assert!(
-        gateway_resp.status().is_success(),
-        "gateway file_search failed: {}",
-        gateway_resp.text().await.unwrap_or_default()
+        gateway_status.is_success(),
+        "gateway file_search failed: {gateway_body}"
+    );
+
+    let answer = output_text(&gateway_body);
+    assert!(
+        answer.contains("ownership"),
+        "gateway should return the recorded final vLLM answer, got: {answer}"
     );
 
     let requests = requests.lock().await;

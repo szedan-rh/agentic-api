@@ -162,7 +162,8 @@ pub struct FunctionToolCall {
     pub call_id: String,
     pub name: String,
     pub arguments: String,
-    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
