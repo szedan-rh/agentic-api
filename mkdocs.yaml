@@ -94,6 +94,8 @@ nav:
   - API Reference: api/index.md
   - Developing:
     - Getting Started: developing/getting-started.md
+  - ADRs:
+    - Response Token Cache: adr/ADR-04_response_token_cache.md
   - Community: community/index.md
 
 extra:
