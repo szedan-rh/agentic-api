@@ -75,6 +75,34 @@ The prototype deliberately marks captured spans with `ends_at_boundary = false`.
 
 ---
 
+## Codex Responses WebSocket requirement
+
+Codex can use plain HTTP `/responses` for baseline Responses compatibility, but the optimized
+incremental path is Responses WebSocket-only.
+
+In the local Codex codebase, HTTP `ResponsesApiRequest` carries the full logical `input` array and
+does not include `previous_response_id`. The WebSocket `response.create` payload does include
+`previous_response_id`. Codex sends that field, plus only the marginal input items, when it can prove
+that the new request is a strict extension of the prior request plus server-returned assistant/tool
+items. If that prefix proof fails, or if the provider does not support WebSockets, Codex falls back to
+a full create without `previous_response_id`.
+
+Implication: HTTP `/v1/responses` is enough for generic clients and for a server-side token-cache
+prototype, but it is not enough for full Codex-style optimization. `agentic-api` needs a Responses
+WebSocket adapter that:
+
+- accepts Codex-style `response.create` frames
+- maps `previous_response_id` into the same response-store continuation path as HTTP
+- normalizes HTTP and WebSocket requests into the same internal Responses request model
+- emits Responses stream events back over the socket
+- preserves Codex fallback semantics when a request is not a valid continuation
+
+The first implementation does not require vLLM itself to speak Responses WebSocket. `agentic-api` can
+terminate the WebSocket, maintain persisted response/conversation state, and call vLLM over HTTP/SSE
+or through the private prompt-cache replay extension internally.
+
+---
+
 ## Performance model
 
 For turn `i`:
@@ -586,16 +614,18 @@ the matching KV blocks.
    - in agentic-api via a compatible Harmony renderer/tokenizer, or
    - in vLLM via an incremental Responses render API, or
    - in vLLM by accepting cached prefix IDs plus marginal messages.
-4. Make the replay prefix router-visible in scaled deployments without sending the full token array.
+4. Add a Responses WebSocket adapter for Codex so `previous_response_id` plus marginal input reaches
+   the same token-cache replay path as HTTP continuations.
+5. Make the replay prefix router-visible in scaled deployments without sending the full token array.
    The preferred contract is a compact prefix hash or block-hash chain that llm-d can score against its
    KV index.
-5. Scope `prompt_cache_ref` to the selected serving endpoint or cache epoch; never treat a process-local
+6. Scope `prompt_cache_ref` to the selected serving endpoint or cache epoch; never treat a process-local
    handle as durable database state.
-6. Ensure vLLM KV events are emitted for the Responses replay path and that llm-d's token/block
+7. Ensure vLLM KV events are emitted for the Responses replay path and that llm-d's token/block
    identity matches the replay-plan token stream and block size.
-7. Avoid returning full `prompt_token_ids` on every production turn. Prefer the `prompt_cache_ref`
+8. Avoid returning full `prompt_token_ids` on every production turn. Prefer the `prompt_cache_ref`
    handle path plus a marginal span, with a full-render fallback on cache miss.
-8. Re-run benchmarks with:
+9. Re-run benchmarks with:
    - APC disabled
    - cold prefixes
    - real agentic traffic profiles
@@ -603,6 +633,7 @@ the matching KV blocks.
    - server-side render/tokenize timing instrumentation
    - agentic-api storage microbenchmarks for latest-span lookup and span persistence
    - an agentic-api end-to-end path that sends `prompt_cache_ref + append_token_ids`
+   - Codex Responses WebSocket first-turn and `previous_response_id` continuation flows
    - llm-d precise-prefix routing, active-active EPP, and tiered KV offload enabled
    - wrong-pod, pod-restart, `AllBlocksCleared`, and shared-storage reload scenarios
 
