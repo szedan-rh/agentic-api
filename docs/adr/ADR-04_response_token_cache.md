@@ -6,6 +6,26 @@
 
 ---
 
+## Bottom Line
+
+This ADR proposes a guarded cached-prefix replay path for long Responses and Conversation
+continuations.
+
+- `agentic-api` should persist enough prompt-token prefix metadata to prove a prior prefix is still
+  valid, then ask vLLM to continue from a compact prefix reference plus only the marginal suffix.
+- On the measured DGX GPT-OSS-20B run, automatic prefix caching already hit and rendered IDs were
+  stable. The useful win was not recovering missed GPU prefill; it was avoiding prompt reconstruction,
+  repeated rendering/tokenization, and large request bodies.
+- The win became clear around 24k prompt tokens in the measured Codex-session fixture, with a fitted
+  TTFT improvement of about 20.4 ms per additional 10k prompt tokens.
+- Full prompt-token arrays are useful for diagnostics and reseeding, but the production hot path should
+  be `prompt_cache_ref + append_token_ids`.
+- The remaining work is strict-prefix validation, safe renderer/template boundary proof, vLLM handle
+  fallback, Codex Responses WebSocket support, llm-d router-visible prefix identity, and broader
+  benchmarking.
+
+---
+
 ## Motivation
 
 This ADR is about making long multi-turn model sessions cheaper to continue. In a chat, coding session,
@@ -343,33 +363,40 @@ matching KV blocks.
 
 ---
 
-## Required production work before replay
+## Implementation Workstreams
 
-1. Replace Harmony-specific boundary language in the implementation with renderer/template-specific
-   safe-boundary proof. Harmony boundaries are one implementation of the generic rule.
-2. Add strict-prefix validation against a fresh full render before any replay path is enabled.
-3. Decide where marginal rendering lives:
-   - in vLLM via an incremental Responses render API, or
-   - in vLLM by accepting cached prefix IDs plus marginal messages, or
-   - in `agentic-api` only if it can call the same renderer/tokenizer source of truth.
-4. Add a Responses WebSocket adapter for Codex so `previous_response_id` plus marginal input reaches
-   the same token-cache replay path as HTTP continuations.
-5. Make the replay prefix router-visible in scaled deployments without sending the full token array.
-6. Scope `prompt_cache_ref` to the selected serving endpoint or cache epoch; never treat a
-   process-local handle as durable database state.
-7. Ensure vLLM KV events are emitted for the Responses replay path and that llm-d's token/block
-   identity matches the replay-plan token stream and block size.
-8. Avoid returning full `prompt_token_ids` on every production turn. Prefer the `prompt_cache_ref`
-   handle path plus a marginal span, with a full-render fallback on cache miss.
-9. Re-run benchmarks with:
-   - APC disabled;
-   - cold prefixes;
-   - non-Harmony Responses models;
-   - real agentic traffic profiles;
-   - longer contexts if the served model length allows it;
-   - server-side render/tokenize timing instrumentation;
-   - `agentic-api` storage microbenchmarks for latest-span lookup and span persistence;
-   - an `agentic-api` end-to-end path that sends `prompt_cache_ref + append_token_ids`;
-   - Codex Responses WebSocket first-turn and `previous_response_id` continuation flows; and
-   - llm-d precise-prefix routing, active-active EPP, tiered KV offload, wrong-pod, pod-restart,
-     `AllBlocksCleared`, and shared-storage reload scenarios.
+The remaining implementation work naturally splits into five workstreams.
+
+1. **`agentic-api` prefix state and replay planning**
+   - Persist prefix metadata with the response or conversation checkpoint.
+   - Add strict-prefix validation against a fresh full render before enabling replay.
+   - Replace Harmony-specific boundary checks with renderer/template-specific safe-boundary proof.
+   - Measure latest-span lookup and span persistence overhead in the state store.
+2. **vLLM replay execution**
+   - Harden the `prompt_cache_ref + append_token_ids` execution path.
+   - Decide where marginal rendering lives: an incremental Responses render API in vLLM, cached prefix
+     IDs plus marginal messages in vLLM, or an `agentic-api` path that calls the same renderer/tokenizer
+     source of truth.
+   - Scope `prompt_cache_ref` to the selected serving endpoint or cache epoch.
+   - Add handle miss fallback, reseeding, and restart behavior.
+   - Avoid returning full `prompt_token_ids` on every production turn.
+3. **Codex Responses WebSocket support**
+   - Add a Responses WebSocket adapter in `agentic-api`.
+   - Map Codex `response.create` frames with `previous_response_id` into the same response-store
+     continuation path as HTTP.
+   - Verify first-turn and continuation flows, including fallback when a request is not a valid
+     continuation.
+4. **Scaled deployment and llm-d routing**
+   - Make the replay prefix router-visible without sending the full token array.
+   - Ensure vLLM KV events are emitted for the Responses replay path.
+   - Align the replay-plan token stream, block size, and prefix or block hash with llm-d precise-prefix
+     routing.
+   - Test active-active EPP, tiered KV offload, wrong-pod routing, pod restart, `AllBlocksCleared`, and
+     shared-storage reload scenarios.
+5. **Benchmarking and acceptance criteria**
+   - Re-run benchmarks with APC disabled, cold prefixes, non-Harmony Responses models, and real
+     agentic traffic profiles.
+   - Add server-side render/tokenize timing instrumentation.
+   - Add an `agentic-api` end-to-end benchmark that sends `prompt_cache_ref + append_token_ids`.
+   - Keep the expected acceptance bar explicit: neutral at short context is acceptable, but long
+     APC-hot agentic loops should show lower TTFT without changing model-visible token IDs.
