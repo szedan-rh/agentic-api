@@ -8,14 +8,21 @@
 
 ## Motivation
 
-Responses continuation lets clients send only new input, but the serving stack can still pay cumulative
-work internally. Today `agentic-api` can rehydrate prior items from the response store, then send a full
-logical `/v1/responses` request upstream. vLLM then reconstructs the model-visible prompt, tokenizes the
-full accumulated context, checks prefix-cache reuse, and decodes.
+This ADR is about making long multi-turn model sessions cheaper to continue. In a chat, coding session,
+or agent loop, each new turn has to be evaluated against the instructions, prior user/assistant/tool
+messages, and the new input. The client-facing API can express that as "continue from this prior
+response or conversation", but the serving layer still needs the model-visible prompt tokens.
+
+Today `agentic-api` can rehydrate prior items from the response store, then send a logical
+`/v1/responses` request to vLLM, the model server. vLLM then reconstructs the model-visible prompt,
+tokenizes the accumulated context, checks prefix-cache reuse, and decodes the next output.
 
 For long agentic loops, the repeated prompt-construction cost becomes visible after automatic prefix
 caching (APC) has already removed most GPU prefill work. The goal is to make continuation efficient at
 the same level as the API contract: only the marginal turn should need to move through the hot path.
+
+APC is vLLM's ability to reuse cached model state when a new request begins with the same prompt-token
+prefix as an earlier request.
 
 The production target is:
 
@@ -23,18 +30,24 @@ The production target is:
 validated cached prefix handle + marginal token suffix
 ```
 
+A prompt-token prefix is the already-rendered, already-tokenized beginning of the model input. Reusing
+it should not change model behavior; it only avoids rebuilding and re-sending state that has already
+been proven to match. The renderer or template is the model-specific formatting step that turns
+Responses items into that token stream.
+
 ---
 
 ## Responses and Conversation APIs
 
-The Responses API is the inference-facing protocol boundary for this ADR. A client can continue a prior
-Responses turn with `previous_response_id`; `agentic-api` uses the response store to rehydrate the
-prior ordered items, then calls vLLM's upstream `/v1/responses`.
+The Responses API is the inference-facing protocol boundary for this ADR. A response is one model turn:
+input goes in, output items come back, and the response can be stored as a continuation checkpoint. A
+client can continue from that checkpoint with `previous_response_id`; `agentic-api` uses the response
+store to rehydrate the prior ordered items, then calls vLLM's upstream `/v1/responses`.
 
-The Conversation API is a state-management convenience over the same continuation problem. A request can
-attach to a durable conversation whose ordered `Conversation.item_ids` is the history source. A stored
-`Response` can belong to that conversation, but should not duplicate the same ordered history in
-`Response.history_item_ids`.
+The Conversation API is a state-management convenience over the same continuation problem. A
+conversation is a durable ordered list of items across many turns. A request can attach to that
+conversation, and `Conversation.item_ids` becomes the history source. A stored `Response` can belong to
+that conversation, but should not duplicate the same ordered history in `Response.history_item_ids`.
 
 For token-prefix caching, both APIs converge to the same hot-path requirement: load the ordered prior
 model-visible items, prove the cached prompt-token prefix still matches that history and the active
@@ -56,7 +69,8 @@ cache contract is model-visible token prefix reuse. Any Responses-served model c
 - vLLM builds a model-visible prompt from Responses input;
 - the prefix token IDs can be proven compatible with the current model, tokenizer, renderer, and template;
 - the append point is a safe renderer/template boundary; and
-- the selected serving engine has, can load, or can cheaply reconstruct the matching KV blocks.
+- the selected serving engine has, can load, or can cheaply reconstruct the matching key/value (KV)
+  cache blocks.
 
 For GPT-OSS, those safe append points are Harmony message boundaries. For other Responses models, the
 safe boundary is whatever the active renderer or chat template defines. For raw-prompt-style models with
@@ -66,6 +80,10 @@ reduce request size, JSON parsing, reconstruction, and repeated prefix-token tra
 ---
 
 ## Empirical Analysis
+
+Time to first token (TTFT) is the latency from request start until the first streamed output token. This
+is the metric most affected by prompt reconstruction and prefill, the model work needed to process the
+prompt before generation starts. Decode speed matters after that first token has already arrived.
 
 The benchmark result is narrow and production-relevant:
 
