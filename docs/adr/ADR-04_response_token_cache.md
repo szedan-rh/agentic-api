@@ -373,13 +373,3 @@ matching KV blocks.
    - Codex Responses WebSocket first-turn and `previous_response_id` continuation flows; and
    - llm-d precise-prefix routing, active-active EPP, tiered KV offload, wrong-pod, pod-restart,
      `AllBlocksCleared`, and shared-storage reload scenarios.
-
----
-
-## Proposal status
-
-Keep ADR-04 in **Draft**.
-
-The measured prefix-handle result justifies implementing the guarded `agentic-api` live replay path
-next. The design should be model-generic: cache prompt-token prefixes produced by the active
-Responses renderer/template, not "Harmony tokens" as a special-case architecture.
