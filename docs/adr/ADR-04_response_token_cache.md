@@ -14,8 +14,8 @@ logical `/v1/responses` request upstream. vLLM then reconstructs the model-visib
 full accumulated context, checks prefix-cache reuse, and decodes.
 
 For long agentic loops, the repeated prompt-construction cost becomes visible after automatic prefix
-caching has already removed most GPU prefill work. The goal is to make continuation efficient at the
-same level as the API contract: only the marginal turn should need to move through the hot path.
+caching (APC) has already removed most GPU prefill work. The goal is to make continuation efficient at
+the same level as the API contract: only the marginal turn should need to move through the hot path.
 
 The production target is:
 
@@ -23,18 +23,28 @@ The production target is:
 validated cached prefix handle + marginal token suffix
 ```
 
-not:
+---
 
-```text
-full conversation JSON every turn
-full prompt token array every turn
-```
+## Responses and Conversation APIs
+
+The Responses API is the inference-facing protocol boundary for this ADR. A client can continue a prior
+Responses turn with `previous_response_id`; `agentic-api` uses the response store to rehydrate the
+prior ordered items, then calls vLLM's upstream `/v1/responses`.
+
+The Conversation API is a state-management convenience over the same continuation problem. A request can
+attach to a durable conversation whose ordered `Conversation.item_ids` is the history source. A stored
+`Response` can belong to that conversation, but should not duplicate the same ordered history in
+`Response.history_item_ids`.
+
+For token-prefix caching, both APIs converge to the same hot-path requirement: load the ordered prior
+model-visible items, prove the cached prompt-token prefix still matches that history and the active
+renderer/template, then send only the marginal suffix through the replay path.
 
 ---
 
-## Decision
+## Proposal
 
-Proceed with a guarded cached-prefix replay design for Responses conversations.
+Use a guarded cached-prefix replay design for Responses conversations.
 
 `agentic-api` should persist durable prompt-token prefix metadata with the conversation state. vLLM
 should remain the authority for rendering, tokenization, prompt-cache handle execution, and generation.
@@ -55,20 +65,18 @@ reduce request size, JSON parsing, reconstruction, and repeated prefix-token tra
 
 ---
 
-## What we learned
+## Empirical Analysis
 
-The benchmark result is not "token arrays make everything faster." Full token-array replay is often the
-wrong production shape.
-
-The useful result is narrower and stronger:
+The benchmark result is narrow and production-relevant:
 
 - APC was already hot on the DGX server. Repeated full renders produced almost complete
   `cached_tokens`, so the measured server did not show a prefill-cache-stability win.
 - Rendered prompt IDs were deterministic in the measured profiles, so "Gain B" from preventing ID drift
   was not observed.
-- Sending the full `prompt_token_ids` array over JSON can be larger than sending the original text
-  prompt. That transport overhead can erase or reverse the render/tokenize win.
-- Minimal-input token replay showed a real but noisy TTFT improvement at longer contexts.
+- Full prompt-token replay over JSON is diagnostic, not the production target. Its transport overhead
+  can erase or reverse the render/tokenize win.
+- Minimal-input token replay showed a real but noisy time-to-first-token (TTFT) improvement at longer
+  contexts.
 - Minimal-input prefix-handle replay was the winning shape: request bodies stayed about 3.1-3.3 KB
   while full text requests grew to hundreds of KB.
 - The dense paired run showed no reliable win around 750 prompt tokens, modest wins at 4.6k-10.4k, and
@@ -350,7 +358,7 @@ matching KV blocks.
 
 ---
 
-## Decision status
+## Proposal status
 
 Keep ADR-04 in **Draft**.
 
