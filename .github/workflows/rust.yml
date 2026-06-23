@@ -48,3 +48,6 @@ jobs:
 
       - name: Run tests
         run: cargo test
+
+      - name: Run Responses WebSocket integration tests
+        run: cargo test -p agentic-server --test responses_websocket_test
