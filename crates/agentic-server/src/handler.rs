@@ -308,7 +308,9 @@ async fn handle_ws_text(socket: &mut WebSocket, state: &AppState, headers: &Head
         if !send_ws_json(socket, value).await {
             return false;
         }
-        lines.push(line);
+        if should_persist {
+            lines.push(line);
+        }
     }
 
     if should_persist && !lines.is_empty() {
