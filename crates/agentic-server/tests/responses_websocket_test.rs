@@ -2,8 +2,11 @@
 mod common;
 
 use std::collections::VecDeque;
+use std::convert::Infallible;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use axum::Router;
 use axum::body::Bytes;
@@ -14,9 +17,10 @@ use futures::{SinkExt, StreamExt};
 use http::StatusCode;
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tokio_util::sync::CancellationToken;
 
 use agentic_core::executor::{ConversationHandler, ExecutionContext, ResponseHandler};
 use agentic_core::proxy::ProxyState;
@@ -31,8 +35,60 @@ struct MockResponsesServer {
     handle: tokio::task::JoinHandle<()>,
 }
 
+enum MockResponse {
+    Static(String),
+    Hanging {
+        first_chunk: String,
+        drop_tx: oneshot::Sender<()>,
+    },
+}
+
+struct HangingSse {
+    first_chunk: Option<Bytes>,
+    drop_tx: Option<oneshot::Sender<()>>,
+}
+
+impl HangingSse {
+    fn new(first_chunk: String, drop_tx: oneshot::Sender<()>) -> Self {
+        Self {
+            first_chunk: Some(Bytes::from(first_chunk)),
+            drop_tx: Some(drop_tx),
+        }
+    }
+}
+
+impl futures::Stream for HangingSse {
+    type Item = Result<Bytes, Infallible>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(first_chunk) = self.first_chunk.take() {
+            Poll::Ready(Some(Ok(first_chunk)))
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl Drop for HangingSse {
+    fn drop(&mut self) {
+        if let Some(drop_tx) = self.drop_tx.take() {
+            let _ = drop_tx.send(());
+        }
+    }
+}
+
 impl MockResponsesServer {
     async fn start(responses: Vec<String>) -> Self {
+        Self::start_with_responses(responses.into_iter().map(MockResponse::Static).collect()).await
+    }
+
+    async fn start_hanging(first_chunk: String) -> (Self, oneshot::Receiver<()>) {
+        let (drop_tx, drop_rx) = oneshot::channel();
+        let server = Self::start_with_responses(vec![MockResponse::Hanging { first_chunk, drop_tx }]).await;
+        (server, drop_rx)
+    }
+
+    async fn start_with_responses(responses: Vec<MockResponse>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let queue = Arc::new(Mutex::new(VecDeque::from(responses)));
@@ -49,10 +105,16 @@ impl MockResponsesServer {
                     let body = serde_json::from_slice::<Value>(&body).expect("request body should be JSON");
                     requests.lock().await.push(body);
                     let response = queue.lock().await.pop_front().expect("mock response queue exhausted");
+                    let body = match response {
+                        MockResponse::Static(response) => axum::body::Body::from(response),
+                        MockResponse::Hanging { first_chunk, drop_tx } => {
+                            axum::body::Body::from_stream(HangingSse::new(first_chunk, drop_tx))
+                        }
+                    };
                     Response::builder()
                         .status(StatusCode::OK)
                         .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
-                        .body(axum::body::Body::from(response))
+                        .body(body)
                         .unwrap()
                         .into_response()
                 }
@@ -123,6 +185,7 @@ async fn storage_backed_state(llm_url: &str) -> StorageBackedState {
     let state = AppState {
         proxy_state,
         exec_ctx,
+        shutdown_token: CancellationToken::new(),
         llm_api_base: config.llm_api_base,
     };
     StorageBackedState { state, _db: db }
@@ -166,6 +229,16 @@ async fn recv_until_completed(ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>
         if is_done {
             return events;
         }
+    }
+}
+
+async fn recv_close_or_end(ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>) {
+    let message = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+        .await
+        .expect("timed out waiting for websocket close");
+    match message {
+        None | Some(Ok(Message::Close(_)) | Err(_)) => {}
+        Some(Ok(message)) => panic!("expected websocket close, got {message:?}"),
     }
 }
 
@@ -419,4 +492,56 @@ async fn test_websocket_ping_returns_pong_without_upstream_request() {
     }
 
     assert!(mock.request_bodies().await.is_empty());
+}
+
+#[tokio::test]
+async fn test_websocket_shutdown_token_closes_idle_connection() {
+    let mock = MockResponsesServer::start(vec![]).await;
+    let fixture = storage_backed_state(&mock.url).await;
+    let shutdown_token = fixture.state.shutdown_token.clone();
+    let (gateway_url, _gateway) = spawn_gateway(fixture.state.clone()).await;
+    let mut ws = connect_responses_ws(&gateway_url).await;
+
+    shutdown_token.cancel();
+
+    recv_close_or_end(&mut ws).await;
+    assert!(mock.request_bodies().await.is_empty());
+}
+
+#[tokio::test]
+async fn test_websocket_client_close_cancels_hanging_upstream_stream() {
+    let first_chunk = format!(
+        "data: {}\n\n",
+        json!({
+            "type": "response.created",
+            "sequence_number": 0,
+            "response": {"id": "resp_upstream_hanging", "status": "in_progress"}
+        })
+    );
+    let (mock, upstream_dropped) = MockResponsesServer::start_hanging(first_chunk).await;
+    let fixture = storage_backed_state(&mock.url).await;
+    let (gateway_url, _gateway) = spawn_gateway(fixture.state.clone()).await;
+    let mut ws = connect_responses_ws(&gateway_url).await;
+
+    send_json(
+        &mut ws,
+        json!({
+            "type": "response.create",
+            "model": "test-model",
+            "input": [{"type": "message", "role": "user", "content": "hi"}],
+            "store": true,
+            "stream": true
+        }),
+    )
+    .await;
+    let event = recv_json(&mut ws).await;
+    assert_eq!(event["type"], "response.created");
+
+    ws.close(None).await.unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), upstream_dropped)
+        .await
+        .expect("timed out waiting for upstream stream to be dropped")
+        .expect("upstream drop sender should notify");
+    assert_eq!(mock.request_bodies().await.len(), 1);
 }

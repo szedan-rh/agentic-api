@@ -3,6 +3,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::routing::{get, post};
 use http::HeaderValue;
+use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 use agentic_core::executor::ExecutionContext;
@@ -59,6 +60,8 @@ impl ServerConfig {
 pub struct AppState {
     pub proxy_state: ProxyState,
     pub exec_ctx: Arc<ExecutionContext>,
+    /// Shared cancellation signal used to drain long-lived handlers.
+    pub shutdown_token: CancellationToken,
     /// vLLM base URL — used by the `/ready` health probe.
     pub llm_api_base: String,
 }
