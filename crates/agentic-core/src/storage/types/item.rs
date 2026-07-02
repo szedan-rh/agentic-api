@@ -91,7 +91,7 @@ impl InOutItem {
                 InOutItem::Output(OutputItem::Message(msg)) => Some(InputItem::Message(msg.into())),
                 InOutItem::Output(OutputItem::Reasoning(r)) => Some(InputItem::Reasoning(r)),
                 InOutItem::Output(OutputItem::FunctionCall(f)) => Some(InputItem::FunctionCall(f)),
-                InOutItem::Output(OutputItem::Unknown) => None,
+                InOutItem::Output(OutputItem::WebSearchCall(_) | OutputItem::Unknown) => None,
             })
             .collect()
     }

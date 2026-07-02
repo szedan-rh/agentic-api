@@ -1,0 +1,332 @@
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::types::io::FunctionTool;
+use crate::types::tools::{WebSearchContextSize, WebSearchToolParam};
+use crate::utils::common::serialize_to_string;
+
+use super::handler::{GatewayExecutor, ToolError, ToolHandler, ToolOutput};
+use super::registry::ToolType;
+
+const DEFAULT_YOU_SEARCH_BASE_URL: &str = "https://ydc-index.io";
+const YOU_API_KEY_ENV: &str = "YOU_API_KEY";
+const YOU_API_BASE_URL_ENV: &str = "YOU_API_BASE_URL";
+
+#[must_use]
+pub(crate) fn web_search_function_tool() -> FunctionTool {
+    FunctionTool {
+        type_: "function".to_owned(),
+        name: "web_search".to_owned(),
+        description: Some(
+            "Search the public web for current information and return structured web and news results.".to_owned(),
+        ),
+        parameters: Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The natural language web search query."
+                },
+                "count": {
+                    "type": "integer",
+                    "description": "Maximum results per section, from 1 to 100."
+                },
+                "freshness": {
+                    "type": "string",
+                    "description": "Optional recency filter: day, week, month, year, or YYYY-MM-DDtoYYYY-MM-DD."
+                },
+                "country": {
+                    "type": "string",
+                    "description": "Optional ISO 3166-1 alpha-2 country code."
+                },
+                "language": {
+                    "type": "string",
+                    "description": "Optional BCP 47 language code."
+                },
+                "include_domains": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional strict allowlist of domains."
+                },
+                "exclude_domains": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional domain blocklist."
+                }
+            },
+            "required": ["query"]
+        })),
+        strict: Some(false),
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WebSearchHandler {
+    client: Arc<reqwest::Client>,
+    api_key: Option<String>,
+    base_url: String,
+}
+
+impl WebSearchHandler {
+    #[must_use]
+    pub fn from_env(client: Arc<reqwest::Client>) -> Self {
+        let api_key = std::env::var(YOU_API_KEY_ENV)
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        let base_url = std::env::var(YOU_API_BASE_URL_ENV)
+            .ok()
+            .map(|value| value.trim().trim_end_matches('/').to_owned())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| DEFAULT_YOU_SEARCH_BASE_URL.to_owned());
+        Self {
+            client,
+            api_key,
+            base_url,
+        }
+    }
+
+    #[must_use]
+    pub fn with_api_key(client: Arc<reqwest::Client>, api_key: String, base_url: &str) -> Self {
+        Self {
+            client,
+            api_key: Some(api_key),
+            base_url: base_url.trim_end_matches('/').to_owned(),
+        }
+    }
+
+    async fn execute_search(&self, call_id: &str, arguments: &str, config: &Value) -> Result<ToolOutput, ToolError> {
+        let api_key = self
+            .api_key
+            .as_deref()
+            .ok_or_else(|| ToolError::Config(format!("{YOU_API_KEY_ENV} must be set to use the web_search tool")))?;
+        let args = WebSearchArguments::from_json(arguments)?;
+        let config = serde_json::from_value::<WebSearchToolParam>(config.clone())
+            .map_err(|e| ToolError::Config(format!("invalid web_search config: {e}")))?;
+        let request = YouSearchRequest::from_args_and_config(&args, &config)?;
+        let url = format!("{}/v1/search", self.base_url);
+        let body = serialize_to_string(&request)
+            .map_err(|e| ToolError::Execution(format!("failed to serialize web_search request: {e}")))?;
+
+        let resp = self
+            .client
+            .post(url)
+            .header("X-API-Key", api_key)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| ToolError::Execution(format!("You.com search request failed: {e}")))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ToolError::Execution(format!(
+                "You.com search returned {status}: {body}"
+            )));
+        }
+
+        let response_text = resp
+            .text()
+            .await
+            .map_err(|e| ToolError::Execution(format!("failed to read You.com search response: {e}")))?;
+        let response: Value = serde_json::from_str(&response_text)
+            .map_err(|e| ToolError::Execution(format!("You.com search returned invalid JSON: {e}")))?;
+        let output = serde_json::to_string(&serde_json::json!({
+            "query": request.query,
+            "results": response
+                .get("results")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({"web": [], "news": []})),
+            "metadata": response.get("metadata").cloned().unwrap_or(Value::Null)
+        }))
+        .map_err(|e| ToolError::Execution(format!("failed to serialize web_search output: {e}")))?;
+
+        Ok(ToolOutput {
+            call_id: call_id.to_owned(),
+            output,
+        })
+    }
+}
+
+impl ToolHandler for WebSearchHandler {
+    fn tool_type(&self) -> ToolType {
+        ToolType::WebSearch
+    }
+
+    fn validate(&self, param: &Value) -> Result<(), ToolError> {
+        serde_json::from_value::<WebSearchToolParam>(param.clone())
+            .map(|_| ())
+            .map_err(|e| ToolError::Config(format!("invalid web_search config: {e}")))
+    }
+
+    fn normalize(&self, _param: &Value) -> Vec<FunctionTool> {
+        vec![web_search_function_tool()]
+    }
+}
+
+impl GatewayExecutor for WebSearchHandler {
+    fn execute(
+        &self,
+        call_id: &str,
+        tool_name: &str,
+        arguments: &str,
+        config: &Value,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+        let call_id = call_id.to_owned();
+        let tool_name = tool_name.to_owned();
+        let arguments = arguments.to_owned();
+        let config = config.clone();
+        Box::pin(async move {
+            if tool_name != "web_search" {
+                return Err(ToolError::Config(format!(
+                    "web_search handler cannot execute tool '{tool_name}'"
+                )));
+            }
+            self.execute_search(&call_id, &arguments, &config).await
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct WebSearchArguments {
+    query: String,
+    count: Option<u16>,
+    freshness: Option<String>,
+    country: Option<String>,
+    language: Option<String>,
+    safesearch: Option<String>,
+    livecrawl: Option<String>,
+    livecrawl_formats: Option<Vec<String>>,
+    crawl_timeout: Option<u16>,
+    include_domains: Option<Vec<String>>,
+    exclude_domains: Option<Vec<String>>,
+    boost_domains: Option<Vec<String>>,
+}
+
+impl WebSearchArguments {
+    fn from_json(arguments: &str) -> Result<Self, ToolError> {
+        let args = serde_json::from_str::<Self>(arguments)
+            .map_err(|e| ToolError::Config(format!("web_search arguments must be valid JSON: {e}")))?;
+        if args.query.trim().is_empty() {
+            return Err(ToolError::Config("web_search query must not be empty".to_owned()));
+        }
+        Ok(args)
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct YouSearchRequest {
+    query: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    count: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    freshness: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    country: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    safesearch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    livecrawl: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    livecrawl_formats: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    crawl_timeout: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    include_domains: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exclude_domains: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    boost_domains: Option<Vec<String>>,
+}
+
+impl YouSearchRequest {
+    fn from_args_and_config(args: &WebSearchArguments, config: &WebSearchToolParam) -> Result<Self, ToolError> {
+        let count = args
+            .count
+            .or_else(|| {
+                config
+                    .search_context_size
+                    .map(WebSearchContextSize::default_count)
+                    .map(u16::from)
+            })
+            .map(validate_count)
+            .transpose()?;
+        let crawl_timeout = args.crawl_timeout.map(validate_crawl_timeout).transpose()?;
+        let config_domains = config
+            .filters
+            .as_ref()
+            .and_then(|filters| clean_vec(filters.allowed_domains.as_deref()));
+        let include_domains = config_domains.or_else(|| clean_vec(args.include_domains.as_deref()));
+        let exclude_domains = clean_vec(args.exclude_domains.as_deref());
+        let boost_domains = clean_vec(args.boost_domains.as_deref());
+        if include_domains.is_some() && (exclude_domains.is_some() || boost_domains.is_some()) {
+            return Err(ToolError::Config(
+                "include_domains cannot be combined with exclude_domains or boost_domains".to_owned(),
+            ));
+        }
+        let country = config
+            .user_location
+            .as_ref()
+            .and_then(|location| clean_string(location.country.as_deref()))
+            .or_else(|| clean_string(args.country.as_deref()))
+            .map(|value| value.to_ascii_uppercase());
+
+        Ok(Self {
+            query: args.query.trim().to_owned(),
+            count,
+            freshness: clean_string(args.freshness.as_deref()),
+            country,
+            language: clean_string(args.language.as_deref()),
+            safesearch: clean_string(args.safesearch.as_deref()),
+            livecrawl: clean_string(args.livecrawl.as_deref()),
+            livecrawl_formats: clean_vec(args.livecrawl_formats.as_deref()),
+            crawl_timeout,
+            include_domains,
+            exclude_domains,
+            boost_domains,
+        })
+    }
+}
+
+fn validate_count(count: u16) -> Result<u8, ToolError> {
+    if (1..=100).contains(&count) {
+        Ok(u8::try_from(count).expect("validated web_search count must fit in u8"))
+    } else {
+        Err(ToolError::Config(
+            "web_search count must be between 1 and 100".to_owned(),
+        ))
+    }
+}
+
+fn validate_crawl_timeout(timeout: u16) -> Result<u8, ToolError> {
+    if (1..=60).contains(&timeout) {
+        u8::try_from(timeout).map_err(|e| ToolError::Config(format!("invalid crawl_timeout: {e}")))
+    } else {
+        Err(ToolError::Config(
+            "web_search crawl_timeout must be between 1 and 60".to_owned(),
+        ))
+    }
+}
+
+fn clean_string(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn clean_vec(values: Option<&[String]>) -> Option<Vec<String>> {
+    let cleaned: Vec<String> = values
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|value| clean_string(Some(value.as_str())))
+        .collect();
+    (!cleaned.is_empty()).then_some(cleaned)
+}

@@ -16,12 +16,15 @@ pub use storage::{
 };
 pub use tool::{
     FunctionHandler, GatewayExecutor, ToolEntry, ToolError, ToolHandler, ToolOutput, ToolRegistry, ToolType,
+    WebSearchHandler,
 };
 pub use types::{
     CodeInterpreterToolParam, EmptyToolNameError, FileSearchToolParam, FunctionTool, FunctionToolCall,
     FunctionToolParam, FunctionToolResultMessage, IncompleteDetails, InputContent, InputImageContent, InputItem,
     InputMessage, InputMessageContent, InputTextContent, InputTokenDetails, McpToolParam, NonEmptyToolName, OutputItem,
     OutputMessage, OutputTextContent, OutputTokenDetails, ReasoningOutput, ReasoningTextContent, RequestPayload,
-    ResponsePayload, ResponseUsage, ResponsesInput, ResponsesTool, ToolChoice, UpstreamRequest, WebSearchToolParam,
+    ResponsePayload, ResponseUsage, ResponsesInput, ResponsesTool, ToolChoice, UpstreamRequest, WebSearchActionSearch,
+    WebSearchCall, WebSearchCallStatus, WebSearchContextSize, WebSearchFilters, WebSearchSource, WebSearchToolParam,
+    WebSearchUserLocation,
 };
 pub use utils::{utcnow_str, uuid7_str};

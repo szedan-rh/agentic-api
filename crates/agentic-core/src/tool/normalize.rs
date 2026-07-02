@@ -3,6 +3,7 @@ use crate::types::io::input::FunctionToolResultMessage;
 use crate::types::tools::ResponsesTool;
 
 use super::handler::ToolOutput;
+use super::web_search::web_search_function_tool;
 
 impl ResponsesTool {
     /// Normalise this tool declaration to the `FunctionTool` wire format that vLLM understands.
@@ -27,10 +28,7 @@ impl ResponsesTool {
                 );
                 None
             }
-            ResponsesTool::WebSearch(_) => {
-                tracing::debug!("web_search tool skipped in normalize — handler not yet registered");
-                None
-            }
+            ResponsesTool::WebSearch(_) => Some(web_search_function_tool()),
             ResponsesTool::FileSearch(_) => {
                 tracing::debug!("file_search tool skipped in normalize — handler not yet registered");
                 None
