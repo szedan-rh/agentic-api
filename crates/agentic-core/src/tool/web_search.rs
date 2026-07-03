@@ -12,9 +12,8 @@ use crate::utils::common::serialize_to_string;
 use super::handler::{GatewayExecutor, ToolError, ToolHandler, ToolOutput};
 use super::registry::ToolType;
 
-const DEFAULT_YOU_SEARCH_BASE_URL: &str = "https://ydc-index.io";
-const YOU_API_KEY_ENV: &str = "YOU_API_KEY";
-const YOU_API_BASE_URL_ENV: &str = "YOU_API_BASE_URL";
+const YOU_API_KEY: &str = "YOU_API_KEY";
+const YOU_API_BASE_URL: &str = "YOU_API_BASE_URL";
 
 #[must_use]
 pub(crate) fn web_search_function_tool() -> FunctionTool {
@@ -68,21 +67,19 @@ pub(crate) fn web_search_function_tool() -> FunctionTool {
 pub struct WebSearchHandler {
     client: Arc<reqwest::Client>,
     api_key: Option<String>,
-    base_url: String,
+    base_url: Option<String>,
 }
 
 impl WebSearchHandler {
     #[must_use]
     pub fn from_env(client: Arc<reqwest::Client>) -> Self {
-        let api_key = std::env::var(YOU_API_KEY_ENV)
+        let api_key = std::env::var(YOU_API_KEY)
             .ok()
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty());
-        let base_url = std::env::var(YOU_API_BASE_URL_ENV)
+        let base_url = std::env::var(YOU_API_BASE_URL)
             .ok()
-            .map(|value| value.trim().trim_end_matches('/').to_owned())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| DEFAULT_YOU_SEARCH_BASE_URL.to_owned());
+            .and_then(|value| clean_base_url(&value));
         Self {
             client,
             api_key,
@@ -95,7 +92,7 @@ impl WebSearchHandler {
         Self {
             client,
             api_key: Some(api_key),
-            base_url: base_url.trim_end_matches('/').to_owned(),
+            base_url: clean_base_url(base_url),
         }
     }
 
@@ -103,12 +100,16 @@ impl WebSearchHandler {
         let api_key = self
             .api_key
             .as_deref()
-            .ok_or_else(|| ToolError::Config(format!("{YOU_API_KEY_ENV} must be set to use the web_search tool")))?;
+            .ok_or_else(|| ToolError::Config(format!("{YOU_API_KEY} must be set to use the web_search tool")))?;
+        let base_url = self
+            .base_url
+            .as_deref()
+            .ok_or_else(|| ToolError::Config(format!("{YOU_API_BASE_URL} must be set to use the web_search tool")))?;
         let args = WebSearchArguments::from_json(arguments)?;
         let config = serde_json::from_value::<WebSearchToolParam>(config.clone())
             .map_err(|e| ToolError::Config(format!("invalid web_search config: {e}")))?;
         let request = YouSearchRequest::from_args_and_config(&args, &config)?;
-        let url = format!("{}/v1/search", self.base_url);
+        let url = format!("{base_url}/v1/search");
         let body = serialize_to_string(&request)
             .map_err(|e| ToolError::Execution(format!("failed to serialize web_search request: {e}")))?;
 
@@ -320,6 +321,11 @@ fn clean_string(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
+}
+
+fn clean_base_url(value: &str) -> Option<String> {
+    let trimmed = value.trim().trim_end_matches('/');
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
 fn clean_vec(values: Option<&[String]>) -> Option<Vec<String>> {

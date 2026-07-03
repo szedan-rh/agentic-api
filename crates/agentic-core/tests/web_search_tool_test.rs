@@ -179,6 +179,26 @@ async fn web_search_handler_posts_to_you_and_formats_results() {
     assert_eq!(output_json["metadata"]["search_uuid"], "search_123");
 }
 
+#[tokio::test]
+async fn web_search_handler_requires_base_url() {
+    let handler = WebSearchHandler::with_api_key(Arc::new(reqwest::Client::new()), "secret-you-key".to_owned(), "");
+
+    let err = handler
+        .execute(
+            "call_search",
+            "web_search",
+            r#"{"query":"rust async"}"#,
+            &serde_json::json!({"type":"web_search_preview"}),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        err.to_string(),
+        "invalid tool config: YOU_API_BASE_URL must be set to use the web_search tool"
+    );
+}
+
 fn web_search_function_call_response() -> support::MockResponse {
     support::MockResponse::Json(
         serde_json::json!({
