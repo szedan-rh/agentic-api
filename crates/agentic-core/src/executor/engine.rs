@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use async_stream::stream;
 use either::Either;
-use futures::future::join_all;
+use futures::StreamExt;
+use futures::stream as futures_stream;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -29,6 +30,8 @@ use crate::utils::common::serialize_to_string;
 pub use crate::executor::inference::BoxStream;
 
 const MAX_GATEWAY_TOOL_ROUNDS: usize = 10;
+const MAX_GATEWAY_TOOL_CALLS_PER_ROUND: usize = 8;
+const MAX_GATEWAY_TOOL_CONCURRENCY: usize = 4;
 
 fn should_persist(ctx: &RequestContext) -> bool {
     ctx.original_request.store
@@ -217,7 +220,7 @@ fn gateway_dispatches(
     registry: &ToolRegistry,
     exec_ctx: &ExecutionContext,
 ) -> ExecutorResult<Vec<GatewayCallDispatch>> {
-    registry
+    let dispatches = registry
         .gateway_owned(calls)
         .into_iter()
         .map(|call| {
@@ -239,7 +242,14 @@ fn gateway_dispatches(
             })
         })
         .collect::<Result<Vec<_>, ToolError>>()
-        .map_err(ExecutorError::from)
+        .map_err(ExecutorError::from)?;
+    if dispatches.len() > MAX_GATEWAY_TOOL_CALLS_PER_ROUND {
+        return Err(ExecutorError::InvalidRequest(format!(
+            "gateway tool call limit exceeded: got {}, max {MAX_GATEWAY_TOOL_CALLS_PER_ROUND} per round",
+            dispatches.len()
+        )));
+    }
+    Ok(dispatches)
 }
 
 async fn execute_gateway_dispatch(dispatch: GatewayCallDispatch) -> GatewayCallExecution {
@@ -285,7 +295,10 @@ async fn execute_gateway_calls(
     exec_ctx: &ExecutionContext,
 ) -> ExecutorResult<Vec<GatewayCallResult>> {
     let dispatches = gateway_dispatches(calls, registry, exec_ctx)?;
-    let executions = join_all(dispatches.into_iter().map(execute_gateway_dispatch)).await;
+    let executions = futures_stream::iter(dispatches.into_iter().map(execute_gateway_dispatch))
+        .buffered(MAX_GATEWAY_TOOL_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
     let mut results = Vec::with_capacity(executions.len());
 
     for execution in executions {
@@ -297,6 +310,9 @@ async fn execute_gateway_calls(
         let (output, status) = match output {
             Ok(output) => (output, WebSearchCallStatus::Completed),
             Err(ToolError::Execution(message)) => {
+                (execution_error_output(&call, &message)?, WebSearchCallStatus::Failed)
+            }
+            Err(ToolError::Config(message)) if tool_type == ToolType::WebSearch => {
                 (execution_error_output(&call, &message)?, WebSearchCallStatus::Failed)
             }
             Err(err @ ToolError::Config(_)) => return Err(err.into()),
@@ -405,6 +421,44 @@ fn emit_sse_json(sender: &mpsc::UnboundedSender<String>, event: &Value) -> Execu
     let event_json = serialize_to_string(&event).map_err(ExecutorError::JsonError)?;
     let _ = sender.send(format!("data: {event_json}\n\n"));
     Ok(())
+}
+
+fn error_sse_chunk(message: &str) -> String {
+    let event = serde_json::json!({ "error": message });
+    let event_json = serialize_to_string(&event).unwrap_or_else(|_| "{\"error\":\"stream error\"}".to_owned());
+    format!("data: {event_json}\n\n")
+}
+
+struct AbortOnDrop<T> {
+    handle: tokio::task::JoinHandle<T>,
+}
+
+impl<T> AbortOnDrop<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self { handle }
+    }
+}
+
+impl<T> std::ops::Deref for AbortOnDrop<T> {
+    type Target = tokio::task::JoinHandle<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.handle
+    }
+}
+
+impl<T> std::ops::DerefMut for AbortOnDrop<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.handle
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if !self.handle.is_finished() {
+            self.handle.abort();
+        }
+    }
 }
 
 fn output_item_value(item: &OutputItem) -> ExecutorResult<Value> {
@@ -573,7 +627,7 @@ fn run_stream(ctx: RequestContext, exec_ctx: Arc<ExecutionContext>, auth: Option
         let should_persist = should_persist(&ctx);
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let exec_ctx_for_run = Arc::clone(&exec_ctx);
-        let mut run_handle = tokio::spawn(async move {
+        let mut run_handle = AbortOnDrop::new(tokio::spawn(async move {
             run_until_gateway_tools_complete(
                 ctx,
                 exec_ctx_for_run.as_ref(),
@@ -582,24 +636,24 @@ fn run_stream(ctx: RequestContext, exec_ctx: Arc<ExecutionContext>, auth: Option
                 Some(&event_tx),
             )
             .await
-        });
+        }));
 
         loop {
             tokio::select! {
                 Some(event) = event_rx.recv() => {
                     yield event;
                 }
-                result = &mut run_handle => {
+                result = &mut run_handle.handle => {
                     while let Ok(event) = event_rx.try_recv() {
                         yield event;
                     }
                     match result {
                         Err(e) => {
-                            yield format!("data: {{\"error\": \"stream task failed: {e}\"}}\n\n");
+                            yield error_sse_chunk(&format!("stream task failed: {e}"));
                             yield DONE_MARKER.to_string();
                         }
                         Ok(Err(e)) => {
-                            yield format!("data: {{\"error\": \"{e}\"}}\n\n");
+                            yield error_sse_chunk(&e.to_string());
                             yield DONE_MARKER.to_string();
                         }
                         Ok(Ok((payload, ctx))) => {

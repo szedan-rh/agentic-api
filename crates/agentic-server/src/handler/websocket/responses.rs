@@ -5,19 +5,15 @@ use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::HeaderMap;
 use axum::response::Response;
+use either::Either;
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use agentic_core::executor::accumulator::ResponseAccumulator;
-use agentic_core::executor::{
-    ExecutionContext, ExecutorError, RequestContext, call_inference, persist_response, rehydrate_conversation,
-};
-use agentic_core::types::ResponsePayload;
+use agentic_core::executor::{BoxStream, ExecuteRequest, ExecutorError};
 use agentic_core::types::request_response::RequestPayload;
-use agentic_core::utils::common::serialize_to_string;
 
 use super::super::common::{MAX_BODY_SIZE, extract_bearer};
 use super::error::WsError;
@@ -120,25 +116,17 @@ async fn handle_ws_text(
     payload.store = true;
 
     let auth = extract_bearer(headers, state.openai_api_key.as_deref());
-    let exec_ctx = Arc::clone(&state.exec_ctx);
-    let ctx = rehydrate_conversation(payload, &exec_ctx).await?;
-    let upstream_json =
-        serialize_to_string(&ctx.enriched_request.to_upstream_request(true)).map_err(ExecutorError::from)?;
-
-    let req = WsStreamRequest {
-        exec_ctx,
-        ctx,
-        upstream_json,
-        auth,
+    let result = ExecuteRequest::new(payload, Arc::clone(&state.exec_ctx))
+        .with_auth(auth)
+        .run()
+        .await?;
+    let Either::Right(stream) = result else {
+        return Err(WsError::Executor(ExecutorError::InvalidRequest(
+            "websocket response.create must produce a stream".to_owned(),
+        )));
     };
-    stream_ws_response(sender, receiver, req, shutdown_token, queue).await
-}
 
-struct WsStreamRequest {
-    exec_ctx: Arc<ExecutionContext>,
-    ctx: RequestContext,
-    upstream_json: String,
-    auth: Option<String>,
+    stream_ws_response(sender, receiver, stream, shutdown_token, queue).await
 }
 
 /// Stream a response from the upstream LLM to the client.
@@ -148,28 +136,10 @@ struct WsStreamRequest {
 async fn stream_ws_response(
     sender: &mut WsSender,
     receiver: &mut WsReceiver,
-    req: WsStreamRequest,
+    mut stream: BoxStream,
     shutdown_token: &CancellationToken,
     queue: &mut VecDeque<String>,
 ) -> Result<(), WsError> {
-    let WsStreamRequest {
-        exec_ctx,
-        ctx,
-        upstream_json,
-        auth,
-    } = req;
-    let should_persist = ctx.original_request.store
-        || ctx.original_request.previous_response_id.is_some()
-        || ctx.conversation_id.is_some();
-    let mut lines = Vec::new();
-    let mut stream = Box::pin(call_inference(
-        upstream_json,
-        exec_ctx.responses_url(),
-        Arc::clone(&exec_ctx.client),
-        auth,
-        exec_ctx.streaming_timeout,
-    ));
-
     'stream: loop {
         let next_line = tokio::select! {
             () = shutdown_token.cancelled() => return Err(WsError::Shutdown),
@@ -196,10 +166,6 @@ async fn stream_ws_response(
         let Some(line) = next_line else {
             break;
         };
-        let line = match line {
-            Ok(line) => line,
-            Err(e) => return Err(WsError::Executor(e)),
-        };
         let Some(data) = line.strip_prefix("data: ") else {
             continue;
         };
@@ -207,57 +173,14 @@ async fn stream_ws_response(
         if data == "[DONE]" {
             continue;
         }
-        let mut value = match serde_json::from_str::<Value>(data) {
+        let value = match serde_json::from_str::<Value>(data) {
             Ok(value) => value,
             Err(e) => return Err(WsError::Executor(ExecutorError::from(e))),
         };
-        apply_gateway_response_ids(&mut value, &ctx);
         send_ws_json(sender, value).await?;
-        if should_persist {
-            lines.push(line);
-        }
-    }
-
-    if should_persist && !lines.is_empty() {
-        let acc = ResponseAccumulator::from_sse_lines(lines, ctx.conversation_id.as_deref());
-        let mut payload = acc.finalize(
-            &ctx.enriched_request.model,
-            ctx.original_request.previous_response_id.as_deref(),
-            ctx.original_request.instructions.as_deref(),
-        );
-        apply_gateway_payload_ids(&mut payload, &ctx);
-        let ch = exec_ctx.conv_handler.clone();
-        let rh = exec_ctx.resp_handler.clone();
-        if let Err(e) = persist_response(payload, ctx, ch, rh).await {
-            warn!("persist failed: {e}");
-        }
     }
 
     Ok(())
-}
-
-fn apply_gateway_response_ids(value: &mut Value, ctx: &RequestContext) {
-    let Some(response) = value.get_mut("response").and_then(Value::as_object_mut) else {
-        return;
-    };
-    response.insert("id".to_owned(), Value::String(ctx.response_id.clone()));
-    if let Some(previous_response_id) = &ctx.original_request.previous_response_id {
-        response.insert(
-            "previous_response_id".to_owned(),
-            Value::String(previous_response_id.clone()),
-        );
-    }
-    if let Some(conversation_id) = &ctx.conversation_id {
-        response.insert("conversation_id".to_owned(), Value::String(conversation_id.clone()));
-    }
-}
-
-fn apply_gateway_payload_ids(payload: &mut ResponsePayload, ctx: &RequestContext) {
-    payload.id.clone_from(&ctx.response_id);
-    payload.conversation_id.clone_from(&ctx.conversation_id);
-    payload
-        .previous_response_id
-        .clone_from(&ctx.original_request.previous_response_id);
 }
 
 async fn handle_ws_error(sender: &mut WsSender, err: WsError) -> bool {

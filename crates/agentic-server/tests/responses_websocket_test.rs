@@ -25,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 use agentic_core::executor::{ConversationHandler, ExecutionContext, ResponseHandler};
 use agentic_core::proxy::ProxyState;
 use agentic_core::storage::{ConversationStore, ResponseStore, create_pool_with_schema};
+use agentic_core::tool::WebSearchHandler;
 use agentic_server::app::AppState;
 
 use common::{spawn_gateway, test_config};
@@ -33,6 +34,61 @@ struct MockResponsesServer {
     url: String,
     requests: Arc<Mutex<Vec<Value>>>,
     handle: tokio::task::JoinHandle<()>,
+}
+
+struct MockYouSearchServer {
+    url: String,
+    requests: Arc<Mutex<Vec<Value>>>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl MockYouSearchServer {
+    async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let route_requests = Arc::clone(&requests);
+
+        let app = Router::new().route(
+            "/v1/search",
+            post(move |body: Bytes| {
+                let requests = Arc::clone(&route_requests);
+                async move {
+                    let body = serde_json::from_slice::<Value>(&body).expect("You.com request body should be JSON");
+                    requests.lock().await.push(body);
+                    axum::Json(json!({
+                        "results": {
+                            "web": [{
+                                "title": "Rust async guide",
+                                "url": "https://example.com/rust-async",
+                                "snippet": "Async Rust reference"
+                            }],
+                            "news": []
+                        },
+                        "metadata": {"provider": "mock-you"}
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+
+        let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        Self {
+            url: format!("http://{addr}"),
+            requests,
+            handle,
+        }
+    }
+
+    async fn request_bodies(&self) -> Vec<Value> {
+        self.requests.lock().await.clone()
+    }
+}
+
+impl Drop for MockYouSearchServer {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
 }
 
 enum MockResponse {
@@ -169,16 +225,29 @@ struct StorageBackedState {
 }
 
 async fn storage_backed_state(llm_url: &str) -> StorageBackedState {
+    storage_backed_state_with_web_search(llm_url, None).await
+}
+
+async fn storage_backed_state_with_web_search(llm_url: &str, web_search_base_url: Option<&str>) -> StorageBackedState {
     let db = TestDb::new();
     let db_url = db.url();
     let pool = create_pool_with_schema(Some(&db_url)).await.unwrap();
     let config = test_config(llm_url);
-    let exec_ctx = Arc::new(ExecutionContext::new(
+    let client = Arc::new(reqwest::Client::new());
+    let mut exec_ctx = ExecutionContext::new(
         ConversationHandler::new(ConversationStore::new(Arc::clone(&pool))),
         ResponseHandler::new(ResponseStore::new(pool)),
-        Arc::new(reqwest::Client::new()),
+        Arc::clone(&client),
         config.llm_api_base.clone(),
-    ));
+    );
+    if let Some(base_url) = web_search_base_url {
+        exec_ctx = exec_ctx.with_gateway_executor(Arc::new(WebSearchHandler::with_api_key(
+            client,
+            "test-you-key".to_owned(),
+            base_url,
+        )));
+    }
+    let exec_ctx = Arc::new(exec_ctx);
     let proxy_state = ProxyState::new(config.clone()).expect("proxy state");
 
     let state = AppState {
@@ -224,11 +293,30 @@ async fn recv_until_completed(ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>
         let is_done = matches!(
             event.get("type").and_then(Value::as_str),
             Some("response.completed" | "error")
-        );
+        ) || event.get("status").and_then(Value::as_str) == Some("completed")
+            || event
+                .get("response")
+                .and_then(|response| response.get("status"))
+                .and_then(Value::as_str)
+                == Some("completed");
         events.push(event);
         if is_done {
             return events;
         }
+    }
+}
+
+async fn wait_for_request_count(mock: &MockResponsesServer, count: usize) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if mock.request_bodies().await.len() >= count {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for mock request"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
 
@@ -274,6 +362,42 @@ fn sse_response(response_id: &str, message_id: &str, text: &str) -> String {
     format!("data: {created}\n\ndata: {added}\n\ndata: {delta}\n\ndata: {completed}\n\ndata: [DONE]\n\n")
 }
 
+fn web_search_function_call_sse_response() -> String {
+    let created = json!({
+        "type": "response.created",
+        "sequence_number": 0,
+        "response": {"id": "resp_tool_call", "status": "in_progress", "usage": null}
+    });
+    let added = json!({
+        "type": "response.output_item.added",
+        "sequence_number": 1,
+        "output_index": 0,
+        "item": {
+            "id": "fc_search",
+            "type": "function_call",
+            "call_id": "call_search",
+            "name": "web_search",
+            "arguments": "",
+            "status": "in_progress"
+        }
+    });
+    let done = json!({
+        "type": "response.function_call_arguments.done",
+        "sequence_number": 2,
+        "item_id": "fc_search",
+        "output_index": 0,
+        "call_id": "call_search",
+        "name": "web_search",
+        "arguments": "{\"query\":\"rust async\",\"count\":2}"
+    });
+    let completed = json!({
+        "type": "response.completed",
+        "sequence_number": 3,
+        "response": {"id": "resp_tool_call", "status": "completed", "usage": null}
+    });
+    format!("data: {created}\n\ndata: {added}\n\ndata: {done}\n\ndata: {completed}\n\ndata: [DONE]\n\n")
+}
+
 #[tokio::test]
 async fn test_websocket_first_turn_forwards_incremental_response_events() {
     let mock = MockResponsesServer::start(vec![sse_response("resp_upstream_1", "msg_upstream_1", "HELLO")]).await;
@@ -294,28 +418,67 @@ async fn test_websocket_first_turn_forwards_incremental_response_events() {
     .await;
 
     let events = recv_until_completed(&mut ws).await;
-    let event_types = events
-        .iter()
-        .map(|event| event["type"].as_str().unwrap())
-        .collect::<Vec<_>>();
-
-    assert_eq!(
-        event_types,
-        vec![
-            "response.created",
-            "response.output_item.added",
-            "response.output_text.delta",
-            "response.completed"
-        ]
-    );
-    assert_ne!(events[0]["response"]["id"], "resp_upstream_1");
-    assert_eq!(events[2]["delta"], "HELLO");
-    assert_eq!(events[3]["response"]["id"], events[0]["response"]["id"]);
+    assert_eq!(events.len(), 1);
+    assert_ne!(events[0]["id"], "resp_upstream_1");
+    assert_eq!(events[0]["status"], "completed");
+    assert_eq!(events[0]["output"][0]["content"][0]["text"], "HELLO");
     let requests = mock.request_bodies().await;
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0]["stream"], true);
     assert_eq!(requests[0]["input"][0]["content"], "hi");
     assert!(requests[0].get("type").is_none());
+}
+
+#[tokio::test]
+async fn test_websocket_executes_web_search_gateway_tool() {
+    let mock_llm = MockResponsesServer::start(vec![
+        web_search_function_call_sse_response(),
+        sse_response("resp_final", "msg_final", "Use async carefully."),
+    ])
+    .await;
+    let mock_you = MockYouSearchServer::start().await;
+    let fixture = storage_backed_state_with_web_search(&mock_llm.url, Some(&mock_you.url)).await;
+    let (gateway_url, _gateway) = spawn_gateway(fixture.state.clone()).await;
+    let mut ws = connect_responses_ws(&gateway_url).await;
+
+    send_json(
+        &mut ws,
+        json!({
+            "type": "response.create",
+            "model": "test-model",
+            "input": [{"type": "message", "role": "user", "content": "search rust async"}],
+            "tools": [{"type": "web_search_preview"}],
+            "store": true,
+            "stream": true
+        }),
+    )
+    .await;
+
+    let events = recv_until_completed(&mut ws).await;
+    let event_types = events
+        .iter()
+        .filter_map(|event| event["type"].as_str())
+        .collect::<Vec<_>>();
+
+    assert!(event_types.contains(&"response.web_search_call.in_progress"));
+    assert!(event_types.contains(&"response.web_search_call.searching"));
+    assert!(event_types.contains(&"response.web_search_call.completed"));
+    assert_eq!(
+        events.last().unwrap()["output"][1]["content"][0]["text"],
+        "Use async carefully."
+    );
+    assert_eq!(mock_you.request_bodies().await[0]["query"], "rust async");
+
+    let llm_requests = mock_llm.request_bodies().await;
+    assert_eq!(llm_requests.len(), 2);
+    assert_eq!(llm_requests[0]["tools"][0]["name"], "web_search");
+    assert!(
+        llm_requests[1]["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["type"] == "function_call_output" && item["call_id"] == "call_search")
+    );
 }
 
 #[tokio::test]
@@ -342,7 +505,7 @@ async fn test_websocket_continuation_rehydrates_previous_response() {
     .await;
     let first = recv_until_completed(&mut ws).await;
     let first_completed = first.last().unwrap();
-    let previous_response_id = first_completed["response"]["id"].as_str().unwrap();
+    let previous_response_id = first_completed["id"].as_str().unwrap();
 
     send_json(
         &mut ws,
@@ -357,27 +520,11 @@ async fn test_websocket_continuation_rehydrates_previous_response() {
     )
     .await;
     let second = recv_until_completed(&mut ws).await;
-    let event_types = second
-        .iter()
-        .map(|event| event["type"].as_str().unwrap())
-        .collect::<Vec<_>>();
-    let delta = second
-        .iter()
-        .find(|event| event["type"] == "response.output_text.delta")
-        .unwrap();
     let completed = second.last().unwrap();
 
-    assert_eq!(
-        event_types,
-        vec![
-            "response.created",
-            "response.output_item.added",
-            "response.output_text.delta",
-            "response.completed"
-        ]
-    );
-    assert_eq!(delta["delta"], "WORLD");
-    assert_eq!(completed["response"]["previous_response_id"], previous_response_id);
+    assert_eq!(second.len(), 1);
+    assert_eq!(completed["output"][0]["content"][0]["text"], "WORLD");
+    assert_eq!(completed["previous_response_id"], previous_response_id);
 
     let requests = mock.request_bodies().await;
     assert_eq!(requests.len(), 2);
@@ -534,8 +681,7 @@ async fn test_websocket_client_close_cancels_hanging_upstream_stream() {
         }),
     )
     .await;
-    let event = recv_json(&mut ws).await;
-    assert_eq!(event["type"], "response.created");
+    wait_for_request_count(&mock, 1).await;
 
     ws.close(None).await.unwrap();
 

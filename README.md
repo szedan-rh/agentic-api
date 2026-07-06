@@ -27,7 +27,8 @@ cargo test
 
 The stateful `/v1/responses` executor supports OpenAI-compatible `web_search`
 tool declarations by normalizing them into a `web_search` function call for
-vLLM. Set `YOU_API_KEY` to enable execution through You.com's Search API.
+vLLM. Set `YOU_API_KEY` and `YOU_API_BASE_URL` to enable execution through
+You.com's Search API.
 
 ## Lint and format
 

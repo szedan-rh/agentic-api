@@ -263,6 +263,65 @@ fn two_web_search_function_call_response() -> support::MockResponse {
     )
 }
 
+fn many_web_search_function_call_response(count: usize) -> support::MockResponse {
+    let output: Vec<serde_json::Value> = (0..count)
+        .map(|index| {
+            serde_json::json!({
+                "id": format!("fc_search_{index}"),
+                "type": "function_call",
+                "call_id": format!("call_search_{index}"),
+                "name": "web_search",
+                "arguments": format!(r#"{{"query":"rust async {index}","count":2}}"#),
+                "status": "completed"
+            })
+        })
+        .collect();
+    support::MockResponse::Json(
+        serde_json::json!({
+            "id": "resp_many_tool_calls",
+            "object": "response",
+            "created_at": 0,
+            "model": "test-model",
+            "status": "completed",
+            "output": output,
+            "usage": null,
+            "incomplete_details": null,
+            "error": null,
+            "previous_response_id": null,
+            "conversation_id": null,
+            "instructions": null
+        })
+        .to_string(),
+    )
+}
+
+fn malformed_web_search_function_call_response() -> support::MockResponse {
+    support::MockResponse::Json(
+        serde_json::json!({
+            "id": "resp_bad_tool_call",
+            "object": "response",
+            "created_at": 0,
+            "model": "test-model",
+            "status": "completed",
+            "output": [{
+                "id": "fc_search_bad",
+                "type": "function_call",
+                "call_id": "call_search_bad",
+                "name": "web_search",
+                "arguments": "{not json",
+                "status": "completed"
+            }],
+            "usage": null,
+            "incomplete_details": null,
+            "error": null,
+            "previous_response_id": null,
+            "conversation_id": null,
+            "instructions": null
+        })
+        .to_string(),
+    )
+}
+
 fn sse_response(events: impl IntoIterator<Item = serde_json::Value>) -> support::MockResponse {
     let mut body = String::new();
     for event in events {
@@ -955,4 +1014,151 @@ async fn execute_errors_after_max_gateway_tool_rounds() {
     }
     assert!(captured_you.try_recv().is_err());
     assert_eq!(llm.request_bodies().await.len(), 10);
+}
+
+#[tokio::test]
+async fn execute_feeds_invalid_web_search_arguments_back_to_model() {
+    let (you_url, mut captured_you, _you_handle) = spawn_mock_you().await;
+    let llm = support::MockServer::start_deque(vec![
+        malformed_web_search_function_call_response(),
+        support::text_response("I could not run that search."),
+    ])
+    .await;
+    let exec_ctx = build_exec_ctx(llm.url(), you_url).await;
+    let web_search: ResponsesTool = serde_json::from_value(serde_json::json!({"type": "web_search_preview"})).unwrap();
+    let payload = RequestPayload {
+        model: "test-model".to_owned(),
+        input: ResponsesInput::Text("look up rust async".to_owned()),
+        instructions: None,
+        previous_response_id: None,
+        conversation_id: None,
+        tools: Some(vec![web_search]),
+        tool_choice: ToolChoice::Auto,
+        stream: false,
+        store: true,
+        include: None,
+        temperature: None,
+        top_p: None,
+        max_output_tokens: Some(1024),
+        truncation: None,
+        metadata: None,
+    };
+
+    let result = ExecuteRequest::new(payload, exec_ctx).run().await.unwrap();
+    assert!(matches!(result, Either::Left(_)));
+    assert!(
+        captured_you.try_recv().is_err(),
+        "invalid arguments should not call You.com"
+    );
+
+    let request_bodies = llm.request_bodies().await;
+    assert_eq!(request_bodies.len(), 2);
+    let second_input = request_bodies[1]["input"]
+        .as_array()
+        .expect("second request input array");
+    let tool_output = second_input
+        .iter()
+        .find(|item| item["type"] == "function_call_output")
+        .expect("second request includes failed web_search output");
+    let output_json: serde_json::Value = serde_json::from_str(tool_output["output"].as_str().unwrap()).unwrap();
+    assert!(
+        output_json["error"]
+            .as_str()
+            .unwrap()
+            .contains("web_search arguments must be valid JSON")
+    );
+}
+
+#[tokio::test]
+async fn execute_errors_when_gateway_tool_call_fanout_exceeds_limit() {
+    let (you_url, mut captured_you, _you_handle) = spawn_mock_you().await;
+    let llm = support::MockServer::start_deque(vec![many_web_search_function_call_response(9)]).await;
+    let exec_ctx = build_exec_ctx(llm.url(), you_url).await;
+    let web_search: ResponsesTool = serde_json::from_value(serde_json::json!({"type": "web_search_preview"})).unwrap();
+    let payload = RequestPayload {
+        model: "test-model".to_owned(),
+        input: ResponsesInput::Text("look up many things".to_owned()),
+        instructions: None,
+        previous_response_id: None,
+        conversation_id: None,
+        tools: Some(vec![web_search]),
+        tool_choice: ToolChoice::Auto,
+        stream: false,
+        store: true,
+        include: None,
+        temperature: None,
+        top_p: None,
+        max_output_tokens: Some(1024),
+        truncation: None,
+        metadata: None,
+    };
+
+    let result = ExecuteRequest::new(payload, exec_ctx).run().await;
+    assert!(
+        result
+            .err()
+            .is_some_and(|err| err.to_string().contains("gateway tool call limit exceeded"))
+    );
+    assert!(
+        captured_you.try_recv().is_err(),
+        "fanout limit should fail before paid searches"
+    );
+    assert_eq!(llm.request_bodies().await.len(), 1);
+}
+
+#[tokio::test]
+async fn stream_error_events_escape_error_messages() {
+    let app = Router::new().route(
+        "/v1/responses",
+        post(|| async {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error":"bad \"quoted\" upstream response"})),
+            )
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let _handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let pool = agentic_core::storage::create_pool_with_schema(None).await.unwrap();
+    let conv_handler = ConversationHandler::new(ConversationStore::new(Arc::clone(&pool)));
+    let resp_handler = ResponseHandler::new(ResponseStore::new(pool));
+    let client = Arc::new(reqwest::Client::new());
+    let exec_ctx = Arc::new(ExecutionContext::new(
+        conv_handler,
+        resp_handler,
+        client,
+        format!("http://{addr}"),
+    ));
+    let payload = RequestPayload {
+        model: "test-model".to_owned(),
+        input: ResponsesInput::Text("hi".to_owned()),
+        instructions: None,
+        previous_response_id: None,
+        conversation_id: None,
+        tools: None,
+        tool_choice: ToolChoice::Auto,
+        stream: true,
+        store: true,
+        include: None,
+        temperature: None,
+        top_p: None,
+        max_output_tokens: Some(1024),
+        truncation: None,
+        metadata: None,
+    };
+
+    let result = ExecuteRequest::new(payload, exec_ctx).run().await.unwrap();
+    let Either::Right(stream) = result else {
+        panic!("expected streaming response");
+    };
+    let chunks: Vec<String> = stream.collect().await;
+    let error_chunk = chunks
+        .iter()
+        .find(|chunk| chunk.starts_with("data: {") && chunk.contains("\"error\""))
+        .expect("stream should include error event");
+    let json = error_chunk.trim().strip_prefix("data: ").unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(json).expect("error event should be valid JSON");
+    let error = parsed["error"].as_str().unwrap();
+    assert!(error.contains(r#"bad \"quoted\" upstream response"#), "{error}");
 }
