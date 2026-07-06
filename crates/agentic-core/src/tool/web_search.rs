@@ -65,14 +65,71 @@ pub(crate) fn web_search_function_tool() -> FunctionTool {
 
 #[derive(Debug, Clone)]
 pub struct WebSearchHandler {
-    client: Arc<reqwest::Client>,
-    api_key: Option<String>,
-    base_url: Option<String>,
+    provider: Arc<dyn WebSearchProvider>,
 }
 
 impl WebSearchHandler {
     #[must_use]
     pub fn from_env(client: Arc<reqwest::Client>) -> Self {
+        Self {
+            provider: Arc::new(YouSearchProvider::from_env(client)),
+        }
+    }
+
+    #[must_use]
+    pub fn with_api_key(client: Arc<reqwest::Client>, api_key: String, base_url: &str) -> Self {
+        Self {
+            provider: Arc::new(YouSearchProvider::with_api_key(client, api_key, base_url)),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_provider(provider: Arc<dyn WebSearchProvider>) -> Self {
+        Self { provider }
+    }
+
+    async fn execute_search(&self, call_id: &str, arguments: &str, config: &Value) -> Result<ToolOutput, ToolError> {
+        let args = WebSearchArguments::from_json(arguments)?;
+        let config = serde_json::from_value::<WebSearchToolParam>(config.clone())
+            .map_err(|e| ToolError::Config(format!("invalid web_search config: {e}")))?;
+        let response = self.provider.search(&args, &config).await?;
+        let output = serde_json::to_string(&serde_json::json!({
+            "query": response.query,
+            "results": response.results,
+            "metadata": response.metadata
+        }))
+        .map_err(|e| ToolError::Execution(format!("failed to serialize web_search output: {e}")))?;
+
+        Ok(ToolOutput {
+            call_id: call_id.to_owned(),
+            output,
+        })
+    }
+}
+
+trait WebSearchProvider: std::fmt::Debug + Send + Sync {
+    fn search<'a>(
+        &'a self,
+        args: &'a WebSearchArguments,
+        config: &'a WebSearchToolParam,
+    ) -> Pin<Box<dyn Future<Output = Result<WebSearchProviderResponse, ToolError>> + Send + 'a>>;
+}
+
+struct WebSearchProviderResponse {
+    query: String,
+    results: Value,
+    metadata: Value,
+}
+
+#[derive(Debug, Clone)]
+struct YouSearchProvider {
+    client: Arc<reqwest::Client>,
+    api_key: Option<String>,
+    base_url: Option<String>,
+}
+
+impl YouSearchProvider {
+    fn from_env(client: Arc<reqwest::Client>) -> Self {
         let api_key = std::env::var(YOU_API_KEY)
             .ok()
             .map(|value| value.trim().to_owned())
@@ -87,69 +144,66 @@ impl WebSearchHandler {
         }
     }
 
-    #[must_use]
-    pub fn with_api_key(client: Arc<reqwest::Client>, api_key: String, base_url: &str) -> Self {
+    fn with_api_key(client: Arc<reqwest::Client>, api_key: String, base_url: &str) -> Self {
         Self {
             client,
             api_key: Some(api_key),
             base_url: clean_base_url(base_url),
         }
     }
+}
 
-    async fn execute_search(&self, call_id: &str, arguments: &str, config: &Value) -> Result<ToolOutput, ToolError> {
-        let api_key = self
-            .api_key
-            .as_deref()
-            .ok_or_else(|| ToolError::Config(format!("{YOU_API_KEY} must be set to use the web_search tool")))?;
-        let base_url = self
-            .base_url
-            .as_deref()
-            .ok_or_else(|| ToolError::Config(format!("{YOU_API_BASE_URL} must be set to use the web_search tool")))?;
-        let args = WebSearchArguments::from_json(arguments)?;
-        let config = serde_json::from_value::<WebSearchToolParam>(config.clone())
-            .map_err(|e| ToolError::Config(format!("invalid web_search config: {e}")))?;
-        let request = YouSearchRequest::from_args_and_config(&args, &config)?;
-        let url = format!("{base_url}/v1/search");
-        let body = serialize_to_string(&request)
-            .map_err(|e| ToolError::Execution(format!("failed to serialize web_search request: {e}")))?;
+impl WebSearchProvider for YouSearchProvider {
+    fn search<'a>(
+        &'a self,
+        args: &'a WebSearchArguments,
+        config: &'a WebSearchToolParam,
+    ) -> Pin<Box<dyn Future<Output = Result<WebSearchProviderResponse, ToolError>> + Send + 'a>> {
+        Box::pin(async move {
+            let api_key = self
+                .api_key
+                .as_deref()
+                .ok_or_else(|| ToolError::Config(format!("{YOU_API_KEY} must be set to use the web_search tool")))?;
+            let base_url = self.base_url.as_deref().ok_or_else(|| {
+                ToolError::Config(format!("{YOU_API_BASE_URL} must be set to use the web_search tool"))
+            })?;
+            let request = YouSearchRequest::from_args_and_config(args, config)?;
+            let url = format!("{base_url}/v1/search");
+            let body = serialize_to_string(&request)
+                .map_err(|e| ToolError::Execution(format!("failed to serialize web_search request: {e}")))?;
 
-        let resp = self
-            .client
-            .post(url)
-            .header("X-API-Key", api_key)
-            .header("Content-Type", "application/json")
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| ToolError::Execution(format!("You.com search request failed: {e}")))?;
+            let resp = self
+                .client
+                .post(url)
+                .header("X-API-Key", api_key)
+                .header("Content-Type", "application/json")
+                .body(body)
+                .send()
+                .await
+                .map_err(|e| ToolError::Execution(format!("You.com search request failed: {e}")))?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ToolError::Execution(format!(
-                "You.com search returned {status}: {body}"
-            )));
-        }
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(ToolError::Execution(format!(
+                    "You.com search returned {status}: {body}"
+                )));
+            }
 
-        let response_text = resp
-            .text()
-            .await
-            .map_err(|e| ToolError::Execution(format!("failed to read You.com search response: {e}")))?;
-        let response: Value = serde_json::from_str(&response_text)
-            .map_err(|e| ToolError::Execution(format!("You.com search returned invalid JSON: {e}")))?;
-        let output = serde_json::to_string(&serde_json::json!({
-            "query": request.query,
-            "results": response
-                .get("results")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!({"web": [], "news": []})),
-            "metadata": response.get("metadata").cloned().unwrap_or(Value::Null)
-        }))
-        .map_err(|e| ToolError::Execution(format!("failed to serialize web_search output: {e}")))?;
-
-        Ok(ToolOutput {
-            call_id: call_id.to_owned(),
-            output,
+            let response_text = resp
+                .text()
+                .await
+                .map_err(|e| ToolError::Execution(format!("failed to read You.com search response: {e}")))?;
+            let response: Value = serde_json::from_str(&response_text)
+                .map_err(|e| ToolError::Execution(format!("You.com search returned invalid JSON: {e}")))?;
+            Ok(WebSearchProviderResponse {
+                query: request.query,
+                results: response
+                    .get("results")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({"web": [], "news": []})),
+                metadata: response.get("metadata").cloned().unwrap_or(Value::Null),
+            })
         })
     }
 }
@@ -335,4 +389,55 @@ fn clean_vec(values: Option<&[String]>) -> Option<Vec<String>> {
         .filter_map(|value| clean_string(Some(value.as_str())))
         .collect();
     (!cleaned.is_empty()).then_some(cleaned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct MockSearchProvider;
+
+    impl WebSearchProvider for MockSearchProvider {
+        fn search<'a>(
+            &'a self,
+            args: &'a WebSearchArguments,
+            _config: &'a WebSearchToolParam,
+        ) -> Pin<Box<dyn Future<Output = Result<WebSearchProviderResponse, ToolError>> + Send + 'a>> {
+            Box::pin(async move {
+                Ok(WebSearchProviderResponse {
+                    query: args.query.trim().to_owned(),
+                    results: serde_json::json!({
+                        "web": [
+                            {
+                                "url": "https://example.com/potato",
+                                "title": "Potato"
+                            }
+                        ],
+                        "news": []
+                    }),
+                    metadata: serde_json::json!({"provider": "mock"}),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn web_search_handler_delegates_to_provider() {
+        let handler = WebSearchHandler::with_provider(Arc::new(MockSearchProvider));
+        let output = handler
+            .execute(
+                "call_search",
+                "web_search",
+                r#"{"query":" potato "}"#,
+                &serde_json::json!({"type": "web_search_preview"}),
+            )
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&output.output).unwrap();
+        assert_eq!(output.call_id, "call_search");
+        assert_eq!(body["query"], "potato");
+        assert_eq!(body["metadata"]["provider"], "mock");
+        assert_eq!(body["results"]["web"][0]["url"], "https://example.com/potato");
+    }
 }
