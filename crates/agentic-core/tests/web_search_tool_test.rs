@@ -483,7 +483,7 @@ async fn execute_runs_web_search_and_sends_tool_output_back_to_model() {
         include: None,
         temperature: None,
         top_p: None,
-        max_output_tokens: None,
+        max_output_tokens: Some(1024),
         truncation: None,
         metadata: None,
     };
@@ -499,6 +499,7 @@ async fn execute_runs_web_search_and_sends_tool_output_back_to_model() {
     let request_bodies = llm.request_bodies().await;
     assert_eq!(request_bodies.len(), 2);
     assert_eq!(request_bodies[0]["tools"][0]["name"], "web_search");
+    assert_eq!(request_bodies[0]["max_output_tokens"], 1024);
     let second_input = request_bodies[1]["input"]
         .as_array()
         .expect("second request input array");
@@ -565,7 +566,7 @@ async fn execute_relaxes_forced_tool_choice_after_web_search_result() {
         include: None,
         temperature: None,
         top_p: None,
-        max_output_tokens: None,
+        max_output_tokens: Some(1024),
         truncation: None,
         metadata: None,
     };
@@ -612,7 +613,7 @@ async fn execute_returns_mixed_client_tool_calls_without_followup_model_request(
         include: None,
         temperature: None,
         top_p: None,
-        max_output_tokens: None,
+        max_output_tokens: Some(1024),
         truncation: None,
         metadata: None,
     };
@@ -658,7 +659,7 @@ async fn execute_returns_mixed_client_tool_calls_without_followup_model_request(
         include: None,
         temperature: None,
         top_p: None,
-        max_output_tokens: None,
+        max_output_tokens: Some(1024),
         truncation: None,
         metadata: None,
     };
@@ -727,7 +728,7 @@ async fn execute_accumulates_usage_across_web_search_model_rounds() {
         include: None,
         temperature: None,
         top_p: None,
-        max_output_tokens: None,
+        max_output_tokens: Some(1024),
         truncation: None,
         metadata: None,
     };
@@ -769,7 +770,7 @@ async fn stream_emits_web_search_lifecycle_events_before_final_payload() {
         include: None,
         temperature: None,
         top_p: None,
-        max_output_tokens: None,
+        max_output_tokens: Some(1024),
         truncation: None,
         metadata: None,
     };
@@ -842,7 +843,7 @@ async fn execute_runs_multiple_web_search_calls_concurrently() {
         include: None,
         temperature: None,
         top_p: None,
-        max_output_tokens: None,
+        max_output_tokens: Some(1024),
         truncation: None,
         metadata: None,
     };
@@ -889,7 +890,7 @@ async fn execute_feeds_web_search_execution_errors_back_to_model() {
         include: None,
         temperature: None,
         top_p: None,
-        max_output_tokens: None,
+        max_output_tokens: Some(1024),
         truncation: None,
         metadata: None,
     };
@@ -938,7 +939,7 @@ async fn execute_errors_after_max_gateway_tool_rounds() {
         include: None,
         temperature: None,
         top_p: None,
-        max_output_tokens: None,
+        max_output_tokens: Some(1024),
         truncation: None,
         metadata: None,
     };
