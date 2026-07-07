@@ -9,104 +9,219 @@ use std::sync::Arc;
 
 use async_stream::stream;
 use either::Either;
+use tokio::sync::mpsc;
 use tracing::warn;
 
-use crate::executor::accumulator::ResponseAccumulator;
+use super::gateway::{
+    append_gateway_calls_to_new_input, append_output_items_to_input, append_tool_outputs,
+    execute_and_emit_output_calls, has_client_owned_calls, public_output_items,
+};
 use crate::executor::error::{ExecutorError, ExecutorResult};
-use crate::executor::inference::{DONE_MARKER, call_inference, fetch_response_json};
-use crate::executor::persist::persist_response;
+use crate::executor::inference::DONE_MARKER;
+use crate::executor::persist::persist_if_needed;
 use crate::executor::rehydrate::rehydrate_conversation;
 use crate::executor::request::{ExecutionContext, RequestContext};
+use crate::executor::upstream::{fetch_blocking_payload, fetch_stream_payload};
+use crate::tool::ToolRegistry;
+use crate::types::io::{ResponseUsage, ToolChoice};
 use crate::types::request_response::{RequestPayload, ResponsePayload};
 use crate::utils::common::serialize_to_string;
 
 pub use crate::executor::inference::BoxStream;
+
+const MAX_GATEWAY_TOOL_ROUNDS: usize = 10;
+
+fn add_usage(total: ResponseUsage, usage: ResponseUsage) -> ResponseUsage {
+    ResponseUsage {
+        input_tokens: total.input_tokens.saturating_add(usage.input_tokens),
+        output_tokens: total.output_tokens.saturating_add(usage.output_tokens),
+        total_tokens: total.total_tokens.saturating_add(usage.total_tokens),
+        input_tokens_details: crate::types::io::InputTokenDetails {
+            cached_tokens: total
+                .input_tokens_details
+                .cached_tokens
+                .saturating_add(usage.input_tokens_details.cached_tokens),
+        },
+        output_tokens_details: crate::types::io::OutputTokenDetails {
+            reasoning_tokens: total
+                .output_tokens_details
+                .reasoning_tokens
+                .saturating_add(usage.output_tokens_details.reasoning_tokens),
+        },
+    }
+}
+
+fn accumulate_usage(total: &mut Option<ResponseUsage>, usage: Option<ResponseUsage>) {
+    if let Some(usage) = usage {
+        *total = Some(total.map_or(usage, |current| add_usage(current, usage)));
+    }
+}
+
+fn error_sse_chunk(message: &str) -> String {
+    let event = serde_json::json!({ "error": message });
+    let event_json = serialize_to_string(&event).unwrap_or_else(|_| "{\"error\":\"stream error\"}".to_owned());
+    format!("data: {event_json}\n\n")
+}
+
+struct AbortOnDrop<T> {
+    handle: tokio::task::JoinHandle<T>,
+}
+
+impl<T> AbortOnDrop<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self { handle }
+    }
+}
+
+impl<T> std::ops::Deref for AbortOnDrop<T> {
+    type Target = tokio::task::JoinHandle<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.handle
+    }
+}
+
+impl<T> std::ops::DerefMut for AbortOnDrop<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.handle
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if !self.handle.is_finished() {
+            self.handle.abort();
+        }
+    }
+}
+
+async fn run_until_gateway_tools_complete(
+    mut ctx: RequestContext,
+    exec_ctx: &ExecutionContext,
+    auth: Option<&str>,
+    stream_upstream: bool,
+    stream_events: Option<&mpsc::UnboundedSender<String>>,
+) -> ExecutorResult<(ResponsePayload, RequestContext)> {
+    let registry = ctx
+        .enriched_request
+        .tools
+        .as_ref()
+        .map_or_else(ToolRegistry::default, |tools| {
+            ToolRegistry::build_with_handlers(tools, |tool_type| exec_ctx.gateway_executors.get(tool_type))
+        });
+    let mut combined_output = Vec::new();
+    let mut combined_usage = None;
+
+    for _ in 0..MAX_GATEWAY_TOOL_ROUNDS {
+        let mut payload = if stream_upstream {
+            fetch_stream_payload(&ctx, exec_ctx, auth).await?
+        } else {
+            fetch_blocking_payload(&ctx, exec_ctx, auth).await?
+        };
+        accumulate_usage(&mut combined_usage, payload.usage);
+        let current_output = std::mem::take(&mut payload.output);
+        let has_client_owned_calls = has_client_owned_calls(&current_output, &registry);
+        let gateway_results =
+            execute_and_emit_output_calls(&current_output, &registry, combined_output.len(), stream_events).await?;
+        let public_output = public_output_items(&current_output, &registry, &gateway_results);
+
+        if has_client_owned_calls {
+            combined_output.extend(public_output);
+            append_gateway_calls_to_new_input(&mut ctx, &current_output, &registry);
+            append_tool_outputs(
+                &mut ctx,
+                gateway_results.into_iter().map(|result| result.input_item).collect(),
+            );
+            payload.output = combined_output;
+            payload.usage = combined_usage;
+            ctx.inject_ids(&mut payload);
+            return Ok((payload, ctx));
+        }
+
+        if gateway_results.is_empty() {
+            combined_output.extend(public_output);
+            payload.output = combined_output;
+            payload.usage = combined_usage;
+            ctx.inject_ids(&mut payload);
+            return Ok((payload, ctx));
+        }
+
+        combined_output.extend(public_output);
+        ctx.enriched_request.tool_choice = ToolChoice::Auto;
+        append_output_items_to_input(&mut ctx.enriched_request.input, &current_output);
+        append_gateway_calls_to_new_input(&mut ctx, &current_output, &registry);
+        append_tool_outputs(
+            &mut ctx,
+            gateway_results.into_iter().map(|result| result.input_item).collect(),
+        );
+    }
+
+    Err(ExecutorError::InvalidRequest(format!(
+        "gateway tool execution exceeded {MAX_GATEWAY_TOOL_ROUNDS} rounds"
+    )))
+}
 
 async fn run_blocking(
     ctx: RequestContext,
     exec_ctx: &ExecutionContext,
     auth: Option<&str>,
 ) -> ExecutorResult<ResponsePayload> {
-    let url = exec_ctx.responses_url();
-    // Non-streaming request: stream=false → full JSON body → from_json.
-    let upstream_json =
-        serialize_to_string(&ctx.enriched_request.to_upstream_request(false)).map_err(ExecutorError::JsonError)?;
+    let (payload, ctx) = run_until_gateway_tools_complete(ctx, exec_ctx, auth, false, None).await?;
 
-    let body = fetch_response_json(upstream_json, &url, &exec_ctx.client, auth).await?;
-
-    let acc = ResponseAccumulator::from_json(&body, ctx.conversation_id.as_deref())?;
-    let mut payload = acc.finalize(
-        &ctx.enriched_request.model,
-        ctx.original_request.previous_response_id.as_deref(),
-        ctx.original_request.instructions.as_deref(),
-    );
-    ctx.inject_ids(&mut payload);
-
-    let should_persist = ctx.original_request.store
-        || ctx.original_request.previous_response_id.is_some()
-        || ctx.original_request.conversation_id.is_some();
-    if should_persist {
-        let ch = exec_ctx.conv_handler.clone();
-        let rh = exec_ctx.resp_handler.clone();
-        if let Err(e) = persist_response(payload.clone(), ctx, ch, rh).await {
-            warn!("persist failed: {e}");
-        }
+    let ch = exec_ctx.conv_handler.clone();
+    let rh = exec_ctx.resp_handler.clone();
+    if let Err(e) = persist_if_needed(payload.clone(), ctx, ch, rh).await {
+        warn!("persist failed: {e}");
     }
 
     Ok(payload)
 }
 
 fn run_stream(ctx: RequestContext, exec_ctx: Arc<ExecutionContext>, auth: Option<String>) -> BoxStream {
-    let url = exec_ctx.responses_url();
-    // Streaming request: stream=true → SSE lines → from_stream.
-    let upstream_json = match serialize_to_string(&ctx.enriched_request.to_upstream_request(true)) {
-        Ok(s) => s,
-        Err(e) => {
-            return Box::pin(stream! {
-                yield format!("data: {{\"error\": \"serialize error: {e}\"}}\n\n");
-                yield DONE_MARKER.to_string();
-            });
-        }
-    };
-
-    // Persist when store=true, or when an ID is passed — context continuity must
-    // be preserved even if the caller sets store=false.
-    let should_persist = ctx.original_request.store
-        || ctx.original_request.previous_response_id.is_some()
-        || ctx.original_request.conversation_id.is_some();
-
     Box::pin(stream! {
-        let line_stream = Box::pin(call_inference(
-            upstream_json,
-            url,
-            Arc::clone(&exec_ctx.client),
-            auth,
-            exec_ctx.streaming_timeout,
-        ));
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let exec_ctx_for_run = Arc::clone(&exec_ctx);
+        let mut run_handle = AbortOnDrop::new(tokio::spawn(async move {
+            run_until_gateway_tools_complete(
+                ctx,
+                exec_ctx_for_run.as_ref(),
+                auth.as_deref(),
+                true,
+                Some(&event_tx),
+            )
+            .await
+        }));
 
-        // from_stream feeds SSE lines to a spawn_blocking worker via channel.
-        // All JSON parsing is CPU-bound and runs off the async executor.
-        match ResponseAccumulator::from_stream(line_stream, ctx.conversation_id.as_deref()).await {
-            Err(e) => {
-                yield format!("data: {{\"error\": \"{e}\"}}\n\n");
-                yield DONE_MARKER.to_string();
-            }
-            Ok(acc) => {
-                let mut payload = acc.finalize(
-                    &ctx.enriched_request.model,
-                    ctx.original_request.previous_response_id.as_deref(),
-                    ctx.original_request.instructions.as_deref(),
-                );
-                ctx.inject_ids(&mut payload);
-                yield payload.as_responses_chunk();
-                yield DONE_MARKER.to_string();
-
-                if should_persist {
-                    let ch = exec_ctx.conv_handler.clone();
-                    let rh = exec_ctx.resp_handler.clone();
-                    if let Err(e) = persist_response(payload, ctx, ch, rh).await {
-                        warn!("persist failed: {e}");
+        loop {
+            tokio::select! {
+                Some(event) = event_rx.recv() => {
+                    yield event;
+                }
+                result = &mut run_handle.handle => {
+                    while let Ok(event) = event_rx.try_recv() {
+                        yield event;
                     }
+                    match result {
+                        Err(e) => {
+                            yield error_sse_chunk(&format!("stream task failed: {e}"));
+                            yield DONE_MARKER.to_string();
+                        }
+                        Ok(Err(e)) => {
+                            yield error_sse_chunk(&e.to_string());
+                            yield DONE_MARKER.to_string();
+                        }
+                        Ok(Ok((payload, ctx))) => {
+                            yield payload.as_responses_chunk();
+                            yield DONE_MARKER.to_string();
+
+                            let ch = exec_ctx.conv_handler.clone();
+                            let rh = exec_ctx.resp_handler.clone();
+                            if let Err(e) = persist_if_needed(payload, ctx, ch, rh).await {
+                                warn!("persist failed: {e}");
+                            }
+                        }
+                    }
+                    break;
                 }
             }
         }

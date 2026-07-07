@@ -9,6 +9,9 @@ pub mod persist;
 pub mod rehydrate;
 pub mod request;
 
+mod gateway;
+mod upstream;
+
 pub use engine::{BoxStream, ExecuteRequest, create_conversation, execute};
 pub use error::{ExecutorError, ExecutorResult};
 pub use inference::call_inference;

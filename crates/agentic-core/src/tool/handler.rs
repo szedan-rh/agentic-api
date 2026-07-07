@@ -67,6 +67,7 @@ pub trait GatewayExecutor: ToolHandler + 'static {
     /// Returns [`ToolError::Execution`] if the tool call fails.
     fn execute(
         &self,
+        call_id: &str,
         tool_name: &str,
         arguments: &str,
         config: &Value,

@@ -7,5 +7,5 @@ pub mod params;
 
 pub use params::{
     CodeInterpreterToolParam, EmptyToolNameError, FileSearchToolParam, FunctionToolParam, McpToolParam,
-    NonEmptyToolName, ResponsesTool, WebSearchToolParam,
+    NonEmptyToolName, ResponsesTool, WebSearchContextSize, WebSearchFilters, WebSearchToolParam, WebSearchUserLocation,
 };

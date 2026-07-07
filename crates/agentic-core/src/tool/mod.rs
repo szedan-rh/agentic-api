@@ -7,7 +7,9 @@ pub mod function;
 pub mod handler;
 pub mod normalize;
 pub mod registry;
+pub mod web_search;
 
 pub use function::FunctionHandler;
 pub use handler::{GatewayExecutor, ToolError, ToolHandler, ToolOutput};
-pub use registry::{ToolEntry, ToolRegistry, ToolType};
+pub use registry::{GatewayDispatchResult, ToolEntry, ToolRegistry, ToolType};
+pub use web_search::WebSearchHandler;
